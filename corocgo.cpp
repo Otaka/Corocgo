@@ -217,34 +217,44 @@ public:
 };
 #endif // COROCGO_HAS_THREADS
 
+// ── Fd wait result (used by wait_file / PollThread) ──
+
+#if COROCGO_HAS_FILE_IO
+struct FdResult { int result=0; int error=0; };
+#endif
+
 // ── Coroutine internals ──
 
-class Coroutine{
+class Coroutine {
 public:
-    function<void()>runnable;
+    function<void()> runnable;
     mco_coro* coroutine=nullptr;
-    BiLinkedCell<Coroutine*>*cell=nullptr;
+    BiLinkedCell<Coroutine*>* cell=nullptr;
     chrono::steady_clock::time_point wakeUpTime;
-    int fdWaitResult=0;
-    int fdWaitError=0;
-    bool inSelect=false;
-    Coroutine* nextFree=nullptr;
+    // Park this coroutine (remove from whichever queue it's currently in).
+    // Must be called from within the coroutine.
+    void moveToWaitingQueue();
+
+    // Unpark from the scheduler thread — idempotent, safe to call from multiple wakers.
+    void moveToRunningQueue();
+
+    // Unpark from an OS thread — routes through pendingWakeQueue under pendingWakeMtx.
+    void moveToRunningQueueExternal();
 };
 
 BiLinkedList<Coroutine*> mainCoroutinesQueue;
 BiLinkedList<Coroutine*> sleepQueue;
 int totalCoroutines=0;
 
-// ── Object pools (intrusive free-lists) ──
+// ── Object pools ──
 
-Coroutine* freeCoroutineHead=nullptr;
+vector<Coroutine*> freeCoroutines;
 BiLinkedCell<Coroutine*>* freeCellHead=nullptr;
 
 Coroutine* acquireCoroutine() {
-    if(freeCoroutineHead) {
-        Coroutine* c=freeCoroutineHead;
-        freeCoroutineHead=c->nextFree;
-        c->nextFree=nullptr;
+    if(!freeCoroutines.empty()) {
+        Coroutine* c=freeCoroutines.back();
+        freeCoroutines.pop_back();
         return c;
     }
     return new Coroutine();
@@ -254,11 +264,7 @@ void releaseCoroutine(Coroutine* c) {
     c->runnable=nullptr;
     c->coroutine=nullptr;
     c->cell=nullptr;
-    c->fdWaitResult=0;
-    c->fdWaitError=0;
-    c->inSelect=false;
-    c->nextFree=freeCoroutineHead;
-    freeCoroutineHead=c;
+    freeCoroutines.push_back(c);
 }
 
 BiLinkedCell<Coroutine*>* acquireCell() {
@@ -295,62 +301,55 @@ class PollThread;
 PollThread* globalPollThread=nullptr;
 #endif
 
+// ── Coroutine queue primitives ──
+
+void Coroutine::moveToWaitingQueue() {
+    if(cell->list) cell->list->remove(cell);
+}
+
+void Coroutine::moveToRunningQueue() {
+    if(cell->list!=nullptr) return;   // already queued — idempotent
+    mainCoroutinesQueue.append(cell);
+}
+
+void Coroutine::moveToRunningQueueExternal() {
+    {
+        coro_lock_guard_t<coro_mutex_t> lock(pendingWakeMtx);
+        if(cell->list!=nullptr) return;
+        pendingWakeQueue.append(cell);
+        threadWaitCount--;
+    }
+    schedulerCV.notify_one();
+}
+
 // ── WaitQueue (internal coroutine condition variable) ──
 
 class WaitQueue {
     BiLinkedList<Coroutine*> waitQueue;
-    bool threadSafe=false;
-    BiLinkedCell<Coroutine*>* threadSafeCell=nullptr;
 public:
     void wait() {
-        Coroutine*cor=(Coroutine*)mco_running()->user_data;
-        mainCoroutinesQueue.remove(cor->cell);
+        Coroutine* cor=(Coroutine*)mco_running()->user_data;
+        cor->moveToWaitingQueue();
         waitQueue.append(cor->cell);
         mco_yield(mco_running());
     }
     void wake() {
-        if(threadSafe) {
-            BiLinkedCell<Coroutine*>*cell=threadSafeCell;
-            if(cell==nullptr) return;
-            threadSafeCell=nullptr;
-            {
-                coro_lock_guard_t<coro_mutex_t> lock(pendingWakeMtx);
-                pendingWakeQueue.append(cell);
-                threadWaitCount--;
-            }
-            schedulerCV.notify_one();
-            return;
-        }
-        BiLinkedCell<Coroutine*>*cell=waitQueue.removeFront();
-        if(cell==NULL) return;
-        Coroutine*cor=cell->data;
-        if(cor->inSelect) {
-            mainCoroutinesQueue.append(cor->cell);
-        } else {
-            mainCoroutinesQueue.append(cell);
-        }
+        BiLinkedCell<Coroutine*>* cell=waitQueue.removeFront();
+        if(cell==nullptr) return;
+        cell->data->moveToRunningQueue();
     }
     void wakeAll() {
-        BiLinkedCell<Coroutine*>*cell=waitQueue.removeFront();
-        while(cell!=NULL) {
-            Coroutine*cor=cell->data;
-            if(cor->inSelect) {
-                mainCoroutinesQueue.append(cor->cell);
-            } else {
-                mainCoroutinesQueue.append(cell);
-            }
+        BiLinkedCell<Coroutine*>* cell=waitQueue.removeFront();
+        while(cell!=nullptr) {
+            cell->data->moveToRunningQueue();
             cell=waitQueue.removeFront();
         }
     }
-    void addWaiter(BiLinkedCell<Coroutine*>*cell) {
+    void addWaiter(BiLinkedCell<Coroutine*>* cell) {
         waitQueue.append(cell);
     }
-    void removeWaiter(BiLinkedCell<Coroutine*>*cell) {
+    void removeWaiter(BiLinkedCell<Coroutine*>* cell) {
         waitQueue.remove(cell);
-    }
-    void setThreadSafe(BiLinkedCell<Coroutine*>*cell) {
-        threadSafe=true;
-        threadSafeCell=cell;
     }
 };
 
@@ -363,8 +362,8 @@ class TSWaitQueue {
 public:
     void wait() {
 #if COROCGO_HAS_THREADS
-        Coroutine*cor=(Coroutine*)mco_running()->user_data;
-        mainCoroutinesQueue.remove(cor->cell);
+        Coroutine* cor=(Coroutine*)mco_running()->user_data;
+        cor->moveToWaitingQueue();
         {
             coro_lock_guard_t<coro_mutex_t> lock(mtx);
             waitQueue.append(cor->cell);
@@ -376,47 +375,38 @@ public:
         }
         mco_yield(mco_running());
 #else
-        // Pico: cooperative polling — stay in mainCoroutinesQueue, just yield.
-        // The caller (e.g. receive()) will re-check the channel on the next scheduler step.
         mco_yield(mco_running());
 #endif
     }
     void wake() {
 #if COROCGO_HAS_THREADS
         if(waitCount.load(std::memory_order_acquire)==0) return;
-        BiLinkedCell<Coroutine*>*cell;
+        BiLinkedCell<Coroutine*>* cell;
         {
             coro_lock_guard_t<coro_mutex_t> lock(mtx);
             cell=waitQueue.removeFront();
-            if(cell==NULL) return;
+            if(cell==nullptr) return;
             waitCount.fetch_sub(1,std::memory_order_release);
         }
-        mainCoroutinesQueue.append(cell);
+        cell->data->moveToRunningQueue();
         {
             coro_lock_guard_t<coro_mutex_t> lock(pendingWakeMtx);
             threadWaitCount--;
         }
 #endif
-        // Pico: no-op — coroutine was never removed from mainCoroutinesQueue
     }
     void wakeExternal() {
 #if COROCGO_HAS_THREADS
         if(waitCount.load(std::memory_order_acquire)==0) return;
-        BiLinkedCell<Coroutine*>*cell;
+        BiLinkedCell<Coroutine*>* cell;
         {
             coro_lock_guard_t<coro_mutex_t> lock(mtx);
             cell=waitQueue.removeFront();
-            if(cell==NULL) return;
+            if(cell==nullptr) return;
             waitCount.fetch_sub(1,std::memory_order_release);
         }
-        {
-            coro_lock_guard_t<coro_mutex_t> lock(pendingWakeMtx);
-            pendingWakeQueue.append(cell);
-            threadWaitCount--;
-        }
-        schedulerCV.notify_one();
+        cell->data->moveToRunningQueueExternal();
 #endif
-        // Pico: no-op — coroutine polls via yield, no linked-list touched from IRQ
     }
     void wakeAll() {
 #if COROCGO_HAS_THREADS
@@ -437,7 +427,6 @@ public:
         }
         schedulerCV.notify_one();
 #endif
-        // Pico: no-op — coroutines poll via yield
     }
 };
 
@@ -449,7 +438,7 @@ class PollThread {
         int fd;
         short events;
         Coroutine* cor;
-        WaitQueue* monitor;
+        FdResult* result;   // points into the waiting coroutine's stack frame
     };
     thread worker;
     mutex regMtx;
@@ -474,10 +463,10 @@ public:
         activeRegs.push_back({});
         worker=thread([this]() { run(); });
     }
-    void addFd(int fd,short events,Coroutine*cor,WaitQueue*monitor) {
+    void addFd(int fd, short events, Coroutine* cor, FdResult* result) {
         {
             lock_guard<mutex> lock(regMtx);
-            pendingRegs.push_back({fd,events,cor,monitor});
+            pendingRegs.push_back({fd,events,cor,result});
         }
         char buf=1;
         write(wakePipe[1],&buf,1);
@@ -515,20 +504,16 @@ private:
             for(int i=(int)pollFds.size()-1;i>=1;i--) {
                 if(pollFds[i].revents==0) continue;
                 Registration reg=activeRegs[i];
-                int result=0;
-                int error=0;
-                auto revents = pollFds[i].revents;
-                if(revents&POLLIN)  result|=corocgo::WAIT_IN;
-                if(revents&POLLOUT) result|=corocgo::WAIT_OUT;
-                if(revents&(POLLERR|POLLNVAL)) error=EIO;
-                if((revents&POLLHUP) && result==0) error=EPIPE;
-                reg.cor->fdWaitResult=result;
-                reg.cor->fdWaitError=error;
+                auto revents=pollFds[i].revents;
+                if(revents&POLLIN)             reg.result->result|=corocgo::WAIT_IN;
+                if(revents&POLLOUT)            reg.result->result|=corocgo::WAIT_OUT;
+                if(revents&(POLLERR|POLLNVAL)) reg.result->error=EIO;
+                if((revents&POLLHUP) && reg.result->result==0) reg.result->error=EPIPE;
                 pollFds[i]=pollFds.back();
                 activeRegs[i]=activeRegs.back();
                 pollFds.pop_back();
                 activeRegs.pop_back();
-                reg.monitor->wake();
+                reg.cor->moveToRunningQueueExternal();
             }
         }
     }
@@ -582,8 +567,7 @@ void _select_wait(void** monitors, int count) {
         tempCells[i]->data=cor;
     }
 
-    cor->inSelect=true;
-    mainCoroutinesQueue.remove(cor->cell);
+    cor->moveToWaitingQueue();  // cell->list = nullptr — idempotent wakes use cor->cell
 
     for(int i=0;i<count;i++) {
         ((WaitQueue*)monitors[i])->addWaiter(tempCells[i]);
@@ -591,14 +575,14 @@ void _select_wait(void** monitors, int count) {
 
     mco_yield(co);
 
-    cor->inSelect=false;
+    // cor->cell is in mainCoroutinesQueue (put there by the first wake())
+    // Clean up any temp cells still in wait queues (from wakers that lost the race)
     for(int i=0;i<count;i++) {
         if(tempCells[i]->list!=nullptr) {
             ((WaitQueue*)monitors[i])->removeWaiter(tempCells[i]);
         }
         releaseCell(tempCells[i]);
     }
-    // cor->cell is already in mainCoroutinesQueue (put there by modified wake())
 }
 
 // ── Thread-safe monitor bridge functions ──
@@ -631,50 +615,42 @@ void _monitor_ts_wake_all(void* monitor) {
 
 #if COROCGO_HAS_FILE_IO
 pair<int,int> wait_file(int fd, int modeBitFlag) {
-    mco_coro*co=mco_running();
-    Coroutine*cor=(Coroutine*)co->user_data;
-    cor->fdWaitResult=0;
-    cor->fdWaitError=0;
+    mco_coro* co=mco_running();
+    Coroutine* cor=(Coroutine*)co->user_data;
     short events=0;
     if(modeBitFlag&WAIT_IN)  events|=POLLIN;
     if(modeBitFlag&WAIT_OUT) events|=POLLOUT;
     if(events==0) return {0,EINVAL};
-    WaitQueue monitor;
-    monitor.setThreadSafe(cor->cell);
-    mainCoroutinesQueue.remove(cor->cell);
+    FdResult res;   // lives on the coroutine's own stack — safe while suspended
+    cor->moveToWaitingQueue();
     {
         coro_lock_guard_t<coro_mutex_t> lock(pendingWakeMtx);
         threadWaitCount++;
     }
-    globalPollThread->addFd(fd,events,cor,&monitor);
+    globalPollThread->addFd(fd,events,cor,&res);
     mco_yield(co);
-    return {cor->fdWaitResult,cor->fdWaitError};
+    return {res.result,res.error};
 }
 #endif // COROCGO_HAS_FILE_IO
 
 // ── Thread-safe exec ──
 
-void Monitor::wake() {
-    ((WaitQueue*)monitor)->wake();
-}
-
 #if COROCGO_HAS_THREADS
-void exec_thread(function<void(Monitor)> future) {
+void exec_thread(function<void(function<void()>)> future) {
     mco_coro* co=mco_running();
     Coroutine* cor=(Coroutine*)co->user_data;
 
-    WaitQueue wq;
-    wq.setThreadSafe(cor->cell);
-    mainCoroutinesQueue.remove(cor->cell);
+    cor->moveToWaitingQueue();
     {
         coro_lock_guard_t<coro_mutex_t> lock(pendingWakeMtx);
         threadWaitCount++;
     }
 
-    Monitor mon((void*)&wq);
     auto* futurePtr=&future;
-    globalThreadPool->submit([futurePtr,mon]() {
-        (*futurePtr)(mon);
+    globalThreadPool->submit([futurePtr,cor]() {
+        (*futurePtr)([cor]() {
+            cor->moveToRunningQueueExternal();
+        });
     });
 
     mco_yield(co);
@@ -715,9 +691,9 @@ void sleep(int milliseconds) {
     mco_coro* co=mco_running();
     Coroutine* cor=(Coroutine*)co->user_data;
     cor->wakeUpTime=chrono::steady_clock::now()+chrono::milliseconds(milliseconds);
-    mainCoroutinesQueue.remove(cor->cell);
-    BiLinkedCell<Coroutine*>*pos=sleepQueue.peekFront();
-    while(pos!=NULL && pos->data->wakeUpTime<=cor->wakeUpTime) {
+    cor->moveToWaitingQueue();
+    BiLinkedCell<Coroutine*>* pos=sleepQueue.peekFront();
+    while(pos!=nullptr && pos->data->wakeUpTime<=cor->wakeUpTime) {
         pos=pos->next;
     }
     sleepQueue.insertBefore(cor->cell, pos);
@@ -738,11 +714,11 @@ static void scheduler_drain_pending() {
 static void scheduler_wake_sleepers() {
     auto now=chrono::steady_clock::now();
     while(true) {
-        BiLinkedCell<Coroutine*>*front=sleepQueue.peekFront();
-        if(front==NULL) break;
+        BiLinkedCell<Coroutine*>* front=sleepQueue.peekFront();
+        if(front==nullptr) break;
         if(front->data->wakeUpTime>now) break;
-        sleepQueue.remove(front);
-        mainCoroutinesQueue.append(front);
+        sleepQueue.remove(front);           // cell->list = nullptr
+        front->data->moveToRunningQueue();
     }
 }
 
@@ -799,11 +775,8 @@ void scheduler_stop() {
         globalThreadPool=nullptr;
     }
 #endif
-    while(freeCoroutineHead) {
-        Coroutine* next=freeCoroutineHead->nextFree;
-        delete freeCoroutineHead;
-        freeCoroutineHead=next;
-    }
+    for(Coroutine* c : freeCoroutines) delete c;
+    freeCoroutines.clear();
     while(freeCellHead) {
         BiLinkedCell<Coroutine*>* next=freeCellHead->next;
         delete freeCellHead;

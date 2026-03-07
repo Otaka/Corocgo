@@ -387,19 +387,19 @@ A `Default` case can be added as the last argument to make `select` non-blocking
 
 When a value originates outside the scheduler (e.g. from a worker thread or OS callback), create the channel with a non-zero `extSize` and use `sendExternalNoBlock()`. The channel must have `extSize > 0`; otherwise the call returns `false`.
 
-`exec_thread` runs a lambda on the thread pool and suspends the calling coroutine until `done.wake()` is called from inside the lambda.
+`exec_thread` runs a lambda on the thread pool and suspends the calling coroutine until the provided `wake` callback is called from inside the lambda.
 
 ```cpp
 auto* ch = makeChannel<int>(4, 4);   // 4-slot internal buffer, 4-slot external buffer
 
 coro([ch]() {
-    // Run blocking work on a thread pool worker; suspend until done.wake() is called
-    exec_thread([ch](Monitor done) {
+    // Run blocking work on a thread pool worker; suspend until wake() is called
+    exec_thread([ch](auto wake) {
         for (int i = 1; i <= 3; i++) {
             this_thread::sleep_for(chrono::milliseconds(100));
             ch->sendExternalNoBlock(i);
         }
-        done.wake();
+        wake();
     });
     ch->close();
 });

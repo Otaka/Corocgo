@@ -110,14 +110,7 @@ void scheduler_stop();
 void coro_yield();
 void sleep(int milliseconds);
 
-class Monitor {
-    void* monitor;
-public:
-    Monitor(void* m):monitor(m) {}
-    void wake();
-};
-
-void exec_thread(std::function<void(Monitor)> future);
+void exec_thread(std::function<void(std::function<void()>)> future);
 std::pair<int,int> wait_file(int fd, int modeBitFlag);
 
 // internal monitor bridge (used by Channel template)
