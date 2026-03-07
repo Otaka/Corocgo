@@ -514,13 +514,14 @@ private:
             }
             for(int i=(int)pollFds.size()-1;i>=1;i--) {
                 if(pollFds[i].revents==0) continue;
-                auto& reg=activeRegs[i];
+                Registration reg=activeRegs[i];
                 int result=0;
                 int error=0;
-                if(pollFds[i].revents&POLLIN)  result|=corocgo::WAIT_IN;
-                if(pollFds[i].revents&POLLOUT) result|=corocgo::WAIT_OUT;
-                if(pollFds[i].revents&(POLLERR|POLLNVAL)) error=EIO;
-                if((pollFds[i].revents&POLLHUP) && result==0) error=EPIPE;
+                auto revents = pollFds[i].revents;
+                if(revents&POLLIN)  result|=corocgo::WAIT_IN;
+                if(revents&POLLOUT) result|=corocgo::WAIT_OUT;
+                if(revents&(POLLERR|POLLNVAL)) error=EIO;
+                if((revents&POLLHUP) && result==0) error=EPIPE;
                 reg.cor->fdWaitResult=result;
                 reg.cor->fdWaitError=error;
                 pollFds[i]=pollFds.back();
@@ -829,6 +830,9 @@ SchedulerResult scheduler_start() {
             } else if(threadWaitCount>0) {
                 schedulerCV.wait(lock,
                     []() { return pendingWakeQueue.size()>0; });
+            } else if(pendingWakeQueue.size()>0) {
+                // Items arrived between drain and this check — retry.
+                continue;
             } else {
                 scheduler_stop();
                 return DEADLOCK;

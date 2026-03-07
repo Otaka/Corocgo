@@ -80,10 +80,8 @@ namespace corocgo {
         template<class L, class Predicate>
         void wait(L&, Predicate) {}
 
-        template<class L, class Rep, class Period, class Predicate>
-        bool wait_for(L&,
-                      const std::chrono::duration<Rep, Period>&,
-                      Predicate pred) {
+        template<class L, class Duration, class Predicate>
+        bool wait_for(L&, const Duration&, Predicate pred) {
             return pred();
         }
     };
