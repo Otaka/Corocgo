@@ -43,16 +43,17 @@ static void checkInt(const char* name, int32_t expected, int32_t actual) {
 
 // ── Method IDs ────────────────────────────────────────────────────────────
 enum MethodId : uint16_t {
-    METHOD_ADD            = 1,
-    METHOD_NOTIFY         = 2,   // fire-and-forget; server returns no payload
-    METHOD_ECHO_BUFFER    = 3,
-    METHOD_PROCESS_MIXED  = 4,   // int32 + buffer -> int32 (sum of prefix + bytes + suffix)
-    METHOD_REVERSE_STRING = 5,
-    METHOD_SLOW           = 6,   // used for timeout test (no loopback -> never responds)
+    METHOD_ADD                  = 1,
+    METHOD_NOTIFY               = 2,   // server returns nullptr (empty response still sent)
+    METHOD_ECHO_BUFFER          = 3,
+    METHOD_PROCESS_MIXED        = 4,   // int32 + buffer -> int32 (sum of prefix + bytes + suffix)
+    METHOD_REVERSE_STRING       = 5,
+    METHOD_SLOW                 = 6,   // used for timeout test (no loopback -> never responds)
+    METHOD_NOTIFY_NO_RESPONSE   = 7,   // callNoResponse: no response packet sent at all
 
     // Two-way test: each manager registers its own method
-    METHOD_LOG_A          = 10,
-    METHOD_LOG_B          = 11,
+    METHOD_LOG_A                = 10,
+    METHOD_LOG_B                = 11,
 };
 
 // ── Loopback helpers ──────────────────────────────────────────────────────
@@ -159,6 +160,25 @@ static void testNotify(RpcManager& rpc) {
 
     checkInt("notify/error",  RPC_OK,  res.error);
     check("notify/no result arg", res.arg == nullptr);
+}
+
+// ── Test 2b: callNoResponse ───────────────────────────────────────────────
+static int g_noResponseCount = 0;
+
+static void testCallNoResponse(RpcManager& rpc) {
+    std::cout << "\n=== Test 2b: callNoResponse (no round-trip, handler still invoked) ===\n";
+
+    g_noResponseCount = 0;
+
+    RpcArg* arg = rpc.getRpcArg();
+    arg->putInt32(777);
+    rpc.callNoResponse(METHOD_NOTIFY_NO_RESPONSE, arg);
+    rpc.disposeRpcArg(arg);
+
+    // Yield briefly so the dispatch coroutine can process the packet.
+    sleep(10);
+
+    checkInt("callNoResponse/handler called", 1, g_noResponseCount);
 }
 
 // ── Test 3: echoBuffer ────────────────────────────────────────────────────
@@ -551,6 +571,13 @@ int main() {
             return nullptr;
         });
 
+        rpc.registerMethod(METHOD_NOTIFY_NO_RESPONSE, [](RpcArg* arg) -> RpcArg* {
+            int32_t value = arg->getInt32();
+            std::cout << "[SERVER] notifyNoResponse(" << value << ") - no round-trip\n";
+            g_noResponseCount++;
+            return nullptr;
+        });
+
         rpc.registerMethod(METHOD_ECHO_BUFFER, [&rpc](RpcArg* arg) -> RpcArg* {
             uint8_t buf[RPC_ARG_BUF_SIZE];
             uint16_t len = arg->getBuffer(buf, sizeof(buf));
@@ -593,6 +620,7 @@ int main() {
         coro([&rpc, outCh, inCh]() {
             testAdd(rpc);
             testNotify(rpc);
+            testCallNoResponse(rpc);
             testEchoBuffer(rpc);
             testProcessMixed(rpc);
             testReverseString(rpc);

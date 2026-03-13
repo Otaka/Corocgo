@@ -279,7 +279,7 @@ int64_t RpcManager::_nowMs() {
 }
 
 RpcPacket RpcManager::_makePacket(uint16_t methodId, uint32_t callId,
-                                   bool isResponse, RpcArg* arg) {
+                                   uint8_t flags, RpcArg* arg) {
     RpcPacket pkt;
     pkt.data[0] = (uint8_t)( methodId       & 0xFF);
     pkt.data[1] = (uint8_t)((methodId >>  8) & 0xFF);
@@ -287,7 +287,7 @@ RpcPacket RpcManager::_makePacket(uint16_t methodId, uint32_t callId,
     pkt.data[3] = (uint8_t)((callId  >>  8)  & 0xFF);
     pkt.data[4] = (uint8_t)((callId  >> 16)  & 0xFF);
     pkt.data[5] = (uint8_t)((callId  >> 24)  & 0xFF);
-    pkt.data[6] = isResponse ? 0x01 : 0x00;
+    pkt.data[6] = flags;
     int payloadLen = (arg && arg->writeIdx > 0) ? arg->writeIdx : 0;
     if (payloadLen > 0) {
         memcpy(&pkt.data[RPC_HEADER_SIZE], arg->buf, payloadLen);
@@ -346,7 +346,7 @@ RpcResult RpcManager::call(uint16_t methodId, RpcArg* arg) {
 
     _pending[callId] = &pending;
 
-    RpcPacket pkt = _makePacket(methodId, callId, false, arg);
+    RpcPacket pkt = _makePacket(methodId, callId, 0x00, arg);
     _outCh->send(pkt);
 
     while (!pending.done && !pending.timedOut) {
@@ -362,6 +362,12 @@ RpcResult RpcManager::call(uint16_t methodId, RpcArg* arg) {
     return {RPC_OK, pending.result};
 }
 
+void RpcManager::callNoResponse(uint16_t methodId, RpcArg* arg) {
+    uint32_t callId = _nextCallId++;
+    RpcPacket pkt = _makePacket(methodId, callId, RPC_FLAG_NO_RESPONSE, arg);
+    _outCh->send(pkt);
+}
+
 void RpcManager::_dispatchLoop() {
     while (_running) {
         auto res = _inCh->receive();
@@ -370,10 +376,12 @@ void RpcManager::_dispatchLoop() {
         RpcPacket& pkt = res.value;
         if (pkt.size < RPC_HEADER_SIZE) continue;
 
-        uint16_t methodId  = (uint16_t)(pkt.data[0] | (pkt.data[1] << 8));
-        uint32_t callId    = (uint32_t)(pkt.data[2] | (pkt.data[3] << 8) |
-                                        (pkt.data[4] << 16) | (pkt.data[5] << 24));
-        bool     isResponse = (pkt.data[6] & 0x01) != 0;
+        uint16_t methodId   = (uint16_t)(pkt.data[0] | (pkt.data[1] << 8));
+        uint32_t callId     = (uint32_t)(pkt.data[2] | (pkt.data[3] << 8) |
+                                         (pkt.data[4] << 16) | (pkt.data[5] << 24));
+        uint8_t  flags      = pkt.data[6];
+        bool     isResponse = (flags & RPC_FLAG_IS_RESPONSE) != 0;
+        bool     noResponse = (flags & RPC_FLAG_NO_RESPONSE) != 0;
         int      payloadLen = pkt.size - RPC_HEADER_SIZE;
 
         if (isResponse) {
@@ -404,9 +412,13 @@ void RpcManager::_dispatchLoop() {
                     }
                     RpcArg* outArg = it->second(inArg);
                     disposeRpcArg(inArg);
-                    RpcPacket resp = _makePacket(methodId, callId, true, outArg);
-                    disposeRpcArg(outArg);
-                    _outCh->send(resp);
+                    if (!noResponse) {
+                        RpcPacket resp = _makePacket(methodId, callId, RPC_FLAG_IS_RESPONSE, outArg);
+                        disposeRpcArg(outArg);
+                        _outCh->send(resp);
+                    } else {
+                        disposeRpcArg(outArg);
+                    }
                 }
             }
         }

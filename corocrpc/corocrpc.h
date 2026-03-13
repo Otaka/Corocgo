@@ -117,7 +117,11 @@ struct RpcArg {
 
 // ── RpcPacket ─────────────────────────────────────────────────────────────
 // Wire format: [methodId:uint16 LE][callId:uint32 LE][flags:uint8][payload:N]
-// flags bit 0: 0 = request, 1 = response
+// flags bit 0 (RPC_FLAG_IS_RESPONSE): 0 = request, 1 = response
+// flags bit 1 (RPC_FLAG_NO_RESPONSE): 1 = server must not send a response
+static constexpr uint8_t RPC_FLAG_IS_RESPONSE = 0x01;
+static constexpr uint8_t RPC_FLAG_NO_RESPONSE = 0x02;
+
 struct RpcPacket {
     uint8_t  data[RPC_PACKET_MAX];
     uint16_t size;
@@ -160,6 +164,11 @@ public:
     // On RPC_OK: caller must disposeRpcArg(result.arg) when done.
     RpcResult call(uint16_t methodId, RpcArg* arg);
 
+    // Client side: fire-and-forget — sends the request and returns immediately.
+    // No response is expected; the server will not send one.
+    // arg: caller-owned input; not disposed by callNoResponse().
+    void callNoResponse(uint16_t methodId, RpcArg* arg);
+
     // Pool: obtain a zeroed RpcArg; return it when done.
     RpcArg* getRpcArg();
     void    disposeRpcArg(RpcArg* arg);
@@ -187,7 +196,7 @@ private:
     std::unordered_map<uint32_t, PendingCall*>                     _pending;
 
     static RpcPacket _makePacket(uint16_t methodId, uint32_t callId,
-                                  bool isResponse, RpcArg* arg);
+                                  uint8_t flags, RpcArg* arg);
     static int64_t   _nowMs();
     void _dispatchLoop();
     void _timeoutLoop();

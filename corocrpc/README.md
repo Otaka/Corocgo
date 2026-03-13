@@ -119,11 +119,21 @@ rpc.registerMethod(METHOD_ID, [&rpc](RpcArg* inArg) -> RpcArg* {
     // read from inArg
     int32_t x = inArg->getInt32();
 
-    // return a result (or nullptr for fire-and-forget)
+    // return a result; or nullptr if there is nothing to return
     RpcArg* out = rpc.getRpcArg();
     out->putInt32(x * 2);
     return out;
     // RpcManager disposes both inArg and out after sending the response
+});
+```
+
+For methods called via `callNoResponse()`, the server never sends a reply regardless of what the handler returns. Returning `nullptr` is the natural choice:
+
+```cpp
+rpc.registerMethod(METHOD_NOTIFY, [](RpcArg* inArg) -> RpcArg* {
+    int32_t value = inArg->getInt32();
+    // ... handle notification ...
+    return nullptr;  // no response will be sent
 });
 ```
 
@@ -146,11 +156,23 @@ if (res.error == RPC_OK) {
 }
 ```
 
+### Fire-and-forget calls (client side)
+
+```cpp
+// Returns immediately — no coroutine blocking, no response expected.
+// The server handler is still invoked, but no response packet is ever sent.
+RpcArg* arg = rpc.getRpcArg();
+arg->putInt32(42);
+
+rpc.callNoResponse(METHOD_NOTIFY, arg);
+rpc.disposeRpcArg(arg);   // caller disposes the input arg
+```
+
 ### RpcResult errors
 
 | Code | Meaning |
 |------|---------|
-| `RPC_OK` | Success; `result.arg` is valid (may be `nullptr` for void methods) |
+| `RPC_OK` | Success; `result.arg` may be `nullptr` if the server handler returned none |
 | `RPC_TIMEOUT` | No response within `timeoutMs` |
 | `RPC_CLOSED` | Input channel was closed before response arrived |
 
@@ -161,7 +183,8 @@ if (res.error == RPC_OK) {
 ```
 [methodId : uint16 LE]
 [callId   : uint32 LE]
-[flags    : uint8]      bit 0: 0=request  1=response
+[flags    : uint8]      bit 0 (RPC_FLAG_IS_RESPONSE): 0=request  1=response
+                        bit 1 (RPC_FLAG_NO_RESPONSE): 1=no response expected (callNoResponse)
 [payload  : N bytes]    serialized RpcArg content
 ```
 
