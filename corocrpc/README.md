@@ -321,6 +321,98 @@ The `RpcManager` internal coroutines observe `inCh->isClosed()` and exit on thei
 
 ---
 
+---
+
+## Streaming Mode
+
+Enable with `#define COROCRPC_STREAMING` (or `-DCOROCRPC_STREAMING` on the compiler command line / Xcode preprocessor macros).
+
+Streaming transfers arbitrarily large payloads that exceed the 1 KB `RpcArg` limit. Data flows as 512-byte chunks with receiver-driven flow control — the receiver signals readiness before each chunk so the sender never blocks the transport. A `corocgo::sleep(0)` yield after every chunk keeps regular `call()` latency unaffected.
+
+### Registering a streaming method (server side)
+
+The handler runs in its own spawned coroutine, so a slow transfer never delays regular RPC dispatch.
+
+```cpp
+rpc.registerStreamedMethod(METHOD_ID, [](RpcStreamServer& s) {
+    // ── Receive phase ──────────────────────────────────────────
+    std::vector<uint8_t> received;
+    uint8_t chunk[512];
+    while (true) {
+        RpcStreamState st = s.waitReadyReceive();   // sends READY, then waits for chunk
+        if (st == RpcStreamState::RECEIVE_FINISH) break;
+        if (st != RpcStreamState::RECEIVE_READY)  return;  // abort/timeout
+        int n = s.receive(chunk, sizeof(chunk));
+        received.insert(received.end(), chunk, chunk + n);
+    }
+
+    // ── Send phase ─────────────────────────────────────────────
+    // process received data, then send response
+    s.sendAll(responseData, responseSize);  // helper: loops chunks + finishSend
+});
+```
+
+### Making a streaming call (client side)
+
+```cpp
+RpcStreamClient sh = rpc.callStreamed(METHOD_ID);  // must run from a coroutine
+
+// Send a large buffer
+sh.sendAll(requestData, requestSize);
+
+// Receive the response
+std::vector<uint8_t> response = sh.receiveAll();
+```
+
+### Manual chunk loop (for progress tracking or partial reads)
+
+```cpp
+RpcStreamClient sh = rpc.callStreamed(METHOD_ID);
+
+// Send phase
+int offset = 0;
+while (offset < totalSize) {
+    if (sh.waitReadySend() != RpcStreamState::SEND_READY) return;  // abort/timeout
+    offset += sh.send(buf, totalSize, offset);  // sends up to 512 bytes, returns count
+}
+sh.finishSend();
+
+// Receive phase
+uint8_t chunk[512];
+while (true) {
+    RpcStreamState st = sh.waitReadyReceive();
+    if (st == RpcStreamState::RECEIVE_FINISH) break;
+    if (st != RpcStreamState::RECEIVE_READY)  break;  // abort/timeout
+    int n = sh.receive(chunk, sizeof(chunk));
+    // ... process chunk ...
+}
+```
+
+### RpcStreamState values
+
+| Value | Meaning |
+|---|---|
+| `SEND_READY` | Receiver sent READY — call `send()` |
+| `RECEIVE_READY` | Data chunk arrived — call `receive()` |
+| `RECEIVE_FINISH` | Sender called `finishSend()` — no more data |
+| `ABORTED` | Either side called `cancel()`, or an ABORT packet arrived |
+| `TIMEOUT` | Wait exceeded the timeout |
+
+### Cancellation
+
+Either side may call `cancel()` at any point. The other side's next `wait*()` call returns `ABORTED`.
+
+### Build with streaming enabled
+
+```bash
+clang++ -std=c++17 -DCOROCRPC_STREAMING corocgo.cpp corocrpc.cpp corocrpc_example.cpp -o test_rpc
+./test_rpc
+```
+
+In Xcode: **Build Settings → Preprocessor Macros → add `COROCRPC_STREAMING`**.
+
+---
+
 ## Build
 
 Add to your build both `corocrpc.cpp` and `corocgo.cpp`. Add the Corocgo directory to your header search paths so `#include "corocgo.h"` resolves.

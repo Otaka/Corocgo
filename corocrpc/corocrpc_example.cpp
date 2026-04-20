@@ -54,6 +54,10 @@ enum MethodId : uint16_t {
     // Two-way test: each manager registers its own method
     METHOD_LOG_A                = 10,
     METHOD_LOG_B                = 11,
+
+#ifdef COROCRPC_STREAMING
+    METHOD_STREAM_ECHO          = 20,
+#endif // COROCRPC_STREAMING
 };
 
 // ── Loopback helpers ──────────────────────────────────────────────────────
@@ -526,9 +530,10 @@ static void testStreamFramer() {
                 rpc.disposeRpcArg(result.arg);
             }
 
-            rpcOut->close();
-            rpcIn->close();
-            // give bridge coroutines a chance to exit
+            rpcOut->close();        // unblocks outbound bridge
+            rpcIn->close();         // unblocks rpc._dispatchLoop
+            framer.readCh->close(); // unblocks inbound bridge
+            coro_yield();           // let all three coroutines exit
             coro_yield();
             delete rpcOut;
             delete rpcIn;
@@ -539,6 +544,122 @@ static void testStreamFramer() {
 
     scheduler_start();
 }
+
+#ifdef COROCRPC_STREAMING
+// ── Test 9: Streaming echo (manual chunk loop) ────────────────────────────
+static void testStreamingEcho() {
+    std::cout << "\n=== Test 9: Streaming echo (2 KB, manual chunks) ===\n";
+
+    scheduler_init();
+
+    auto aTob = makeChannel<RpcPacket>(8);
+    auto bToa = makeChannel<RpcPacket>(8);
+
+    RpcManager server(aTob, bToa, 5000);
+    RpcManager client(bToa, aTob, 5000);
+
+    server.registerStreamedMethod(METHOD_STREAM_ECHO, [](RpcStreamServer& s) {
+        std::vector<uint8_t> received;
+        uint8_t chunk[512];
+        while (true) {
+            RpcStreamState st = s.waitReadyReceive();
+            if (st == RpcStreamState::RECEIVE_FINISH) break;
+            if (st != RpcStreamState::RECEIVE_READY) return;
+            int n = s.receive(chunk, sizeof(chunk));
+            received.insert(received.end(), chunk, chunk + n);
+        }
+        int offset = 0;
+        while (offset < (int)received.size()) {
+            RpcStreamState st = s.waitReadySend();
+            if (st != RpcStreamState::SEND_READY) return;
+            int n = s.send(received.data(), (int)received.size(), offset);
+            offset += n;
+        }
+        s.finishSend();
+    });
+
+    coro([&client, aTob, bToa]() {
+        std::vector<uint8_t> testData(2048);
+        for (int i = 0; i < 2048; i++) testData[i] = (uint8_t)(i & 0xFF);
+
+        RpcStreamClient sh = client.callStreamed(METHOD_STREAM_ECHO);
+
+        int sentOffset = 0;
+        while (sentOffset < (int)testData.size()) {
+            RpcStreamState st = sh.waitReadySend();
+            check("stream waitReadySend returns SEND_READY",
+                  st == RpcStreamState::SEND_READY);
+            if (st != RpcStreamState::SEND_READY) { aTob->close(); bToa->close(); return; }
+            int n = sh.send(testData.data(), (int)testData.size(), sentOffset);
+            sentOffset += n;
+        }
+        sh.finishSend();
+
+        std::vector<uint8_t> response;
+        uint8_t buf[512];
+        while (true) {
+            RpcStreamState st = sh.waitReadyReceive();
+            if (st == RpcStreamState::RECEIVE_FINISH) break;
+            check("stream waitReadyReceive returns RECEIVE_READY",
+                  st == RpcStreamState::RECEIVE_READY);
+            if (st != RpcStreamState::RECEIVE_READY) break;
+            int n = sh.receive(buf, sizeof(buf));
+            response.insert(response.end(), buf, buf + n);
+        }
+
+        check("stream echo: received size matches sent", response.size() == testData.size());
+        check("stream echo: data content matches", response == testData);
+
+        aTob->close();
+        bToa->close();
+    });
+
+    scheduler_start();
+}
+
+// ── Test 10: Streaming sendAll/receiveAll helpers ─────────────────────────
+static void testStreamingSendAll() {
+    std::cout << "\n=== Test 10: Streaming sendAll/receiveAll (3 KB) ===\n";
+
+    scheduler_init();
+
+    auto aTob = makeChannel<RpcPacket>(8);
+    auto bToa = makeChannel<RpcPacket>(8);
+
+    RpcManager server(aTob, bToa, 5000);
+    RpcManager client(bToa, aTob, 5000);
+
+    server.registerStreamedMethod(METHOD_STREAM_ECHO, [](RpcStreamServer& s) {
+        std::vector<uint8_t> received;
+        uint8_t chunk[512];
+        while (true) {
+            RpcStreamState st = s.waitReadyReceive();
+            if (st == RpcStreamState::RECEIVE_FINISH) break;
+            if (st != RpcStreamState::RECEIVE_READY) return;
+            int n = s.receive(chunk, sizeof(chunk));
+            received.insert(received.end(), chunk, chunk + n);
+        }
+        s.sendAll(received.data(), (int)received.size());
+    });
+
+    coro([&client, aTob, bToa]() {
+        std::vector<uint8_t> testData(3000);
+        for (int i = 0; i < 3000; i++) testData[i] = (uint8_t)((i * 7) & 0xFF);
+
+        RpcStreamClient sh = client.callStreamed(METHOD_STREAM_ECHO);
+        sh.sendAll(testData.data(), (int)testData.size());
+        std::vector<uint8_t> response = sh.receiveAll();
+
+        check("sendAll/receiveAll: size matches", response.size() == testData.size());
+        check("sendAll/receiveAll: data matches", response == testData);
+
+        aTob->close();
+        bToa->close();
+    });
+
+    scheduler_start();
+}
+#endif // COROCRPC_STREAMING
 
 // ── Main ──────────────────────────────────────────────────────────────────
 
@@ -641,6 +762,14 @@ int main() {
 
     // Test 8: StreamFramer
     testStreamFramer();
+
+#ifdef COROCRPC_STREAMING
+    // Test 9: Streaming echo (manual chunks)
+    testStreamingEcho();
+
+    // Test 10: Streaming sendAll/receiveAll
+    testStreamingSendAll();
+#endif // COROCRPC_STREAMING
 
     // ── Summary ───────────────────────────────────────────────────────────
     std::cout << "\n=== Results: " << g_passed << " passed, " << g_failed << " failed ===\n";

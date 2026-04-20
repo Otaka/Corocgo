@@ -11,6 +11,7 @@
 #include <cstring>
 #include <functional>
 #include <unordered_map>
+#include <vector>
 #include "corocgo.h"  // from Corocgo project; adjust search path as needed
 
 namespace corocrpc {
@@ -122,12 +123,29 @@ struct RpcArg {
 static constexpr uint8_t RPC_FLAG_IS_RESPONSE = 0x01;
 static constexpr uint8_t RPC_FLAG_NO_RESPONSE = 0x02;
 
+#ifdef COROCRPC_STREAMING
+static constexpr uint8_t RPC_FLAG_IS_STREAM      = 0x04;
+static constexpr uint8_t RPC_FLAG_STREAM_READY   = 0x08;
+static constexpr uint8_t RPC_FLAG_STREAM_END     = 0x10;
+static constexpr uint8_t RPC_FLAG_STREAM_ABORT   = 0x20;
+// RPC_FLAG_STREAM_TIMEOUT is synthesised internally by _timeoutLoop(); never goes over the wire.
+static constexpr uint8_t RPC_FLAG_STREAM_TIMEOUT = 0x40;
+
+static constexpr int RPC_STREAM_CHUNK_SIZE = 512;
+#endif // COROCRPC_STREAMING
+
 struct RpcPacket {
     uint8_t  data[RPC_PACKET_MAX];
     uint16_t size;
 };
 
 // ── RpcResult ─────────────────────────────────────────────────────────────
+#ifdef COROCRPC_STREAMING
+// Forward declarations for stream classes
+class RpcStreamClient;
+class RpcStreamServer;
+#endif // COROCRPC_STREAMING
+
 enum RpcError {
     RPC_OK      = 0,
     RPC_TIMEOUT = 1,
@@ -138,6 +156,93 @@ struct RpcResult {
     int     error;  // RpcError
     RpcArg* arg;    // non-null when error == RPC_OK; caller must disposeRpcArg()
 };
+
+#ifdef COROCRPC_STREAMING
+enum class RpcStreamState {
+    SEND_READY,      // READY received from receiver — can call send()
+    RECEIVE_READY,   // data chunk arrived — can call receive()
+    RECEIVE_FINISH,  // END received — sender has no more data
+    ABORTED,         // ABORT received or cancel() called
+    TIMEOUT          // wait exceeded timeout
+};
+
+// Internal session shared between RpcStreamClient/Server and RpcManager dispatch.
+struct RpcStreamSession {
+    uint32_t                     streamId;
+    uint16_t                     methodId;
+    corocgo::Channel<RpcPacket>* inCh;
+    int64_t                      waitDeadlineMs; // 0 = not waiting
+};
+
+class RpcStreamClient {
+public:
+    RpcStreamClient(RpcStreamSession* session,
+                    corocgo::Channel<RpcPacket>* outCh,
+                    uint16_t methodId,
+                    uint32_t streamId,
+                    int timeoutMs,
+                    std::function<void(uint32_t)> cleanup);
+
+    // Request-send phase: wait for server READY, then send one chunk (<=512 bytes).
+    RpcStreamState waitReadySend(int timeoutMs = -1);
+    int            send(const uint8_t* buf, int size, int offset); // returns bytes sent
+    void           finishSend();
+
+    // Response-receive phase: signal server we are ready, then read arriving chunk.
+    RpcStreamState waitReadyReceive(int timeoutMs = -1);
+    int            receive(uint8_t* buf, int maxSize); // returns bytes read
+
+    void cancel();
+
+    // Helpers
+    void                 sendAll(const uint8_t* buf, int size);
+    std::vector<uint8_t> receiveAll();
+
+private:
+    RpcStreamSession*            _session;
+    corocgo::Channel<RpcPacket>* _outCh;
+    uint16_t                     _methodId;
+    uint32_t                     _streamId;
+    int                          _timeoutMs;
+    bool                         _sendFinished;
+    RpcPacket                    _pendingPacket;
+    bool                         _hasPendingPacket;
+    std::function<void(uint32_t)> _cleanup;
+};
+
+class RpcStreamServer {
+public:
+    RpcStreamServer(RpcStreamSession* session,
+                    corocgo::Channel<RpcPacket>* outCh,
+                    uint16_t methodId,
+                    uint32_t streamId,
+                    int timeoutMs);
+
+    // Request-receive phase: send READY to client, then wait for chunk.
+    RpcStreamState waitReadyReceive(int timeoutMs = -1);
+    int            receive(uint8_t* buf, int maxSize); // returns bytes read
+
+    // Response-send phase: wait for client READY, then send one chunk.
+    RpcStreamState waitReadySend(int timeoutMs = -1);
+    int            send(const uint8_t* buf, int size, int offset); // returns bytes sent
+    void           finishSend();
+
+    void cancel();
+
+    // Helper
+    void sendAll(const uint8_t* buf, int size);
+
+private:
+    RpcStreamSession*            _session;
+    corocgo::Channel<RpcPacket>* _outCh;
+    uint16_t                     _methodId;
+    uint32_t                     _streamId;
+    int                          _timeoutMs;
+    bool                         _sendFinished;
+    RpcPacket                    _pendingPacket;
+    bool                         _hasPendingPacket;
+};
+#endif // COROCRPC_STREAMING
 
 // ── RpcManager ────────────────────────────────────────────────────────────
 class RpcManager {
@@ -169,6 +274,15 @@ public:
     // arg: caller-owned input; not disposed by callNoResponse().
     void callNoResponse(uint16_t methodId, RpcArg* arg);
 
+#ifdef COROCRPC_STREAMING
+    // Client side: open a streaming session (must run from a coroutine).
+    RpcStreamClient callStreamed(uint16_t methodId);
+
+    // Server side: register a streaming handler for methodId.
+    void registerStreamedMethod(uint16_t methodId,
+                                std::function<void(RpcStreamServer&)> handler);
+#endif // COROCRPC_STREAMING
+
     // Pool: obtain a zeroed RpcArg; return it when done.
     RpcArg* getRpcArg();
     void    disposeRpcArg(RpcArg* arg);
@@ -194,6 +308,10 @@ private:
 
     std::unordered_map<uint16_t, std::function<RpcArg*(RpcArg*)>> _methods;
     std::unordered_map<uint32_t, PendingCall*>                     _pending;
+#ifdef COROCRPC_STREAMING
+    std::unordered_map<uint32_t, RpcStreamSession*>               _streamSessions;
+    std::unordered_map<uint16_t, std::function<void(RpcStreamServer&)>> _streamMethods;
+#endif // COROCRPC_STREAMING
 
     static RpcPacket _makePacket(uint16_t methodId, uint32_t callId,
                                   uint8_t flags, RpcArg* arg);

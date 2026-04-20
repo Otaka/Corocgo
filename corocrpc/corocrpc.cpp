@@ -271,12 +271,235 @@ uint16_t RpcArg::getBuffer(void* out, uint16_t maxLen) {
     return copy;
 }
 
-// ── RpcManager ────────────────────────────────────────────────────────────
+// ── Time helper (used by RpcManager and streaming) ───────────────────────
 
-int64_t RpcManager::_nowMs() {
+static int64_t nowMs() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
+
+#ifdef COROCRPC_STREAMING
+
+// ── Stream helpers ────────────────────────────────────────────────────────
+
+static RpcPacket makeStreamPacket(uint16_t methodId, uint32_t streamId,
+                                   uint8_t flags,
+                                   const uint8_t* payload = nullptr,
+                                   int payloadLen = 0) {
+    RpcPacket pkt{};
+    pkt.data[0] = (uint8_t)(methodId & 0xFF);
+    pkt.data[1] = (uint8_t)(methodId >> 8);
+    pkt.data[2] = (uint8_t)(streamId & 0xFF);
+    pkt.data[3] = (uint8_t)((streamId >> 8) & 0xFF);
+    pkt.data[4] = (uint8_t)((streamId >> 16) & 0xFF);
+    pkt.data[5] = (uint8_t)((streamId >> 24) & 0xFF);
+    pkt.data[6] = flags;
+    if (payload && payloadLen > 0)
+        memcpy(&pkt.data[RPC_HEADER_SIZE], payload, payloadLen);
+    pkt.size = (uint16_t)(RPC_HEADER_SIZE + payloadLen);
+    return pkt;
+}
+
+// ── RpcStreamClient ───────────────────────────────────────────────────────
+
+RpcStreamClient::RpcStreamClient(RpcStreamSession* session,
+                                  corocgo::Channel<RpcPacket>* outCh,
+                                  uint16_t methodId,
+                                  uint32_t streamId,
+                                  int timeoutMs,
+                                  std::function<void(uint32_t)> cleanup)
+    : _session(session), _outCh(outCh), _methodId(methodId),
+      _streamId(streamId), _timeoutMs(timeoutMs),
+      _sendFinished(false), _hasPendingPacket(false),
+      _cleanup(std::move(cleanup)) {}
+
+RpcStreamState RpcStreamClient::waitReadySend(int timeoutMs) {
+    int tms = (timeoutMs < 0) ? _timeoutMs : timeoutMs;
+    _session->waitDeadlineMs = nowMs() + tms;
+    auto res = _session->inCh->receive();
+    _session->waitDeadlineMs = 0;
+    if (res.error) return RpcStreamState::ABORTED;
+    uint8_t flags = res.value.data[6];
+    if (flags & RPC_FLAG_STREAM_TIMEOUT) return RpcStreamState::TIMEOUT;
+    if (flags & RPC_FLAG_STREAM_ABORT)   return RpcStreamState::ABORTED;
+    if (flags & RPC_FLAG_STREAM_READY)   return RpcStreamState::SEND_READY;
+    return RpcStreamState::ABORTED;
+}
+
+int RpcStreamClient::send(const uint8_t* buf, int size, int offset) {
+    int remaining = size - offset;
+    int toSend = (remaining > RPC_STREAM_CHUNK_SIZE) ? RPC_STREAM_CHUNK_SIZE : remaining;
+    RpcPacket pkt = makeStreamPacket(_methodId, _streamId,
+                                      RPC_FLAG_IS_STREAM,
+                                      buf + offset, toSend);
+    _outCh->send(pkt);
+    corocgo::sleep(0);
+    return toSend;
+}
+
+void RpcStreamClient::finishSend() {
+    if (_sendFinished) return;
+    _sendFinished = true;
+    RpcPacket pkt = makeStreamPacket(_methodId, _streamId,
+                                      RPC_FLAG_IS_STREAM | RPC_FLAG_STREAM_END);
+    _outCh->send(pkt);
+}
+
+RpcStreamState RpcStreamClient::waitReadyReceive(int timeoutMs) {
+    RpcPacket ready = makeStreamPacket(_methodId, _streamId,
+                                        RPC_FLAG_IS_STREAM | RPC_FLAG_STREAM_READY);
+    _outCh->send(ready);
+
+    int tms = (timeoutMs < 0) ? _timeoutMs : timeoutMs;
+    _session->waitDeadlineMs = nowMs() + tms;
+    auto res = _session->inCh->receive();
+    _session->waitDeadlineMs = 0;
+    if (res.error) return RpcStreamState::ABORTED;
+    _pendingPacket    = res.value;
+    _hasPendingPacket = true;
+    uint8_t flags = res.value.data[6];
+    if (flags & RPC_FLAG_STREAM_TIMEOUT) return RpcStreamState::TIMEOUT;
+    if (flags & RPC_FLAG_STREAM_ABORT)   return RpcStreamState::ABORTED;
+    if (flags & RPC_FLAG_STREAM_END) {
+        _cleanup(_streamId);
+        return RpcStreamState::RECEIVE_FINISH;
+    }
+    return RpcStreamState::RECEIVE_READY;
+}
+
+int RpcStreamClient::receive(uint8_t* buf, int maxSize) {
+    if (!_hasPendingPacket) return 0;
+    _hasPendingPacket = false;
+    int payloadLen = _pendingPacket.size - RPC_HEADER_SIZE;
+    if (payloadLen <= 0) return 0;
+    int toCopy = (payloadLen < maxSize) ? payloadLen : maxSize;
+    memcpy(buf, &_pendingPacket.data[RPC_HEADER_SIZE], toCopy);
+    return toCopy;
+}
+
+void RpcStreamClient::cancel() {
+    RpcPacket pkt = makeStreamPacket(_methodId, _streamId,
+                                      RPC_FLAG_IS_STREAM | RPC_FLAG_STREAM_ABORT);
+    _outCh->send(pkt);
+    _cleanup(_streamId);
+}
+
+void RpcStreamClient::sendAll(const uint8_t* buf, int size) {
+    int offset = 0;
+    while (offset < size) {
+        RpcStreamState st = waitReadySend();
+        if (st != RpcStreamState::SEND_READY) return;
+        offset += send(buf, size, offset);
+    }
+    finishSend();
+}
+
+std::vector<uint8_t> RpcStreamClient::receiveAll() {
+    std::vector<uint8_t> result;
+    uint8_t chunk[RPC_STREAM_CHUNK_SIZE];
+    while (true) {
+        RpcStreamState st = waitReadyReceive();
+        if (st == RpcStreamState::RECEIVE_FINISH) break;
+        if (st != RpcStreamState::RECEIVE_READY)  break;
+        int n = receive(chunk, sizeof(chunk));
+        result.insert(result.end(), chunk, chunk + n);
+    }
+    return result;
+}
+
+// ── RpcStreamServer ───────────────────────────────────────────────────────
+
+RpcStreamServer::RpcStreamServer(RpcStreamSession* session,
+                                  corocgo::Channel<RpcPacket>* outCh,
+                                  uint16_t methodId,
+                                  uint32_t streamId,
+                                  int timeoutMs)
+    : _session(session), _outCh(outCh), _methodId(methodId),
+      _streamId(streamId), _timeoutMs(timeoutMs),
+      _sendFinished(false), _hasPendingPacket(false) {}
+
+RpcStreamState RpcStreamServer::waitReadyReceive(int timeoutMs) {
+    RpcPacket ready = makeStreamPacket(_methodId, _streamId,
+                                        RPC_FLAG_IS_STREAM | RPC_FLAG_IS_RESPONSE | RPC_FLAG_STREAM_READY);
+    _outCh->send(ready);
+
+    int tms = (timeoutMs < 0) ? _timeoutMs : timeoutMs;
+    _session->waitDeadlineMs = nowMs() + tms;
+    auto res = _session->inCh->receive();
+    _session->waitDeadlineMs = 0;
+    if (res.error) return RpcStreamState::ABORTED;
+    _pendingPacket    = res.value;
+    _hasPendingPacket = true;
+    uint8_t flags = res.value.data[6];
+    if (flags & RPC_FLAG_STREAM_TIMEOUT) return RpcStreamState::TIMEOUT;
+    if (flags & RPC_FLAG_STREAM_ABORT)   return RpcStreamState::ABORTED;
+    if (flags & RPC_FLAG_STREAM_END)     return RpcStreamState::RECEIVE_FINISH;
+    return RpcStreamState::RECEIVE_READY;
+}
+
+int RpcStreamServer::receive(uint8_t* buf, int maxSize) {
+    if (!_hasPendingPacket) return 0;
+    _hasPendingPacket = false;
+    int payloadLen = _pendingPacket.size - RPC_HEADER_SIZE;
+    if (payloadLen <= 0) return 0;
+    int toCopy = (payloadLen < maxSize) ? payloadLen : maxSize;
+    memcpy(buf, &_pendingPacket.data[RPC_HEADER_SIZE], toCopy);
+    return toCopy;
+}
+
+RpcStreamState RpcStreamServer::waitReadySend(int timeoutMs) {
+    int tms = (timeoutMs < 0) ? _timeoutMs : timeoutMs;
+    _session->waitDeadlineMs = nowMs() + tms;
+    auto res = _session->inCh->receive();
+    _session->waitDeadlineMs = 0;
+    if (res.error) return RpcStreamState::ABORTED;
+    uint8_t flags = res.value.data[6];
+    if (flags & RPC_FLAG_STREAM_TIMEOUT) return RpcStreamState::TIMEOUT;
+    if (flags & RPC_FLAG_STREAM_ABORT)   return RpcStreamState::ABORTED;
+    if (flags & RPC_FLAG_STREAM_READY)   return RpcStreamState::SEND_READY;
+    return RpcStreamState::ABORTED;
+}
+
+int RpcStreamServer::send(const uint8_t* buf, int size, int offset) {
+    int remaining = size - offset;
+    int toSend = (remaining > RPC_STREAM_CHUNK_SIZE) ? RPC_STREAM_CHUNK_SIZE : remaining;
+    RpcPacket pkt = makeStreamPacket(_methodId, _streamId,
+                                      RPC_FLAG_IS_STREAM | RPC_FLAG_IS_RESPONSE,
+                                      buf + offset, toSend);
+    _outCh->send(pkt);
+    corocgo::sleep(0);
+    return toSend;
+}
+
+void RpcStreamServer::finishSend() {
+    if (_sendFinished) return;
+    _sendFinished = true;
+    RpcPacket pkt = makeStreamPacket(_methodId, _streamId,
+                                      RPC_FLAG_IS_STREAM | RPC_FLAG_IS_RESPONSE | RPC_FLAG_STREAM_END);
+    _outCh->send(pkt);
+}
+
+void RpcStreamServer::cancel() {
+    RpcPacket pkt = makeStreamPacket(_methodId, _streamId,
+                                      RPC_FLAG_IS_STREAM | RPC_FLAG_IS_RESPONSE | RPC_FLAG_STREAM_ABORT);
+    _outCh->send(pkt);
+}
+
+void RpcStreamServer::sendAll(const uint8_t* buf, int size) {
+    int offset = 0;
+    while (offset < size) {
+        RpcStreamState st = waitReadySend();
+        if (st != RpcStreamState::SEND_READY) return;
+        offset += send(buf, size, offset);
+    }
+    finishSend();
+}
+
+#endif // COROCRPC_STREAMING
+
+// ── RpcManager ────────────────────────────────────────────────────────────
+
+int64_t RpcManager::_nowMs() { return nowMs(); }
 
 RpcPacket RpcManager::_makePacket(uint16_t methodId, uint32_t callId,
                                    uint8_t flags, RpcArg* arg) {
@@ -368,6 +591,41 @@ void RpcManager::callNoResponse(uint16_t methodId, RpcArg* arg) {
     _outCh->send(pkt);
 }
 
+#ifdef COROCRPC_STREAMING
+RpcStreamClient RpcManager::callStreamed(uint16_t methodId) {
+    uint32_t streamId = _nextCallId++;
+
+    RpcStreamSession* session = new RpcStreamSession();
+    session->streamId       = streamId;
+    session->methodId       = methodId;
+    session->inCh           = corocgo::makeChannel<RpcPacket>(4);
+    session->waitDeadlineMs = 0;
+    _streamSessions[streamId] = session;
+
+    RpcPacket open = makeStreamPacket(methodId, streamId, RPC_FLAG_IS_STREAM);
+    _outCh->send(open);
+
+    auto cleanup = [this](uint32_t id) {
+        auto it = _streamSessions.find(id);
+        if (it != _streamSessions.end()) {
+            it->second->inCh->close();
+            delete it->second->inCh;
+            delete it->second;
+            _streamSessions.erase(it);
+        }
+    };
+
+    return RpcStreamClient(session, _outCh, methodId, streamId, _timeoutMs,
+                           std::move(cleanup));
+}
+
+void RpcManager::registerStreamedMethod(
+        uint16_t methodId,
+        std::function<void(RpcStreamServer&)> handler) {
+    _streamMethods[methodId] = std::move(handler);
+}
+#endif // COROCRPC_STREAMING
+
 void RpcManager::_dispatchLoop() {
     while (_running) {
         auto res = _inCh->receive();
@@ -380,6 +638,50 @@ void RpcManager::_dispatchLoop() {
         uint32_t callId     = (uint32_t)(pkt.data[2] | (pkt.data[3] << 8) |
                                          (pkt.data[4] << 16) | (pkt.data[5] << 24));
         uint8_t  flags      = pkt.data[6];
+
+#ifdef COROCRPC_STREAMING
+        if (flags & RPC_FLAG_IS_STREAM) {
+            bool isResp = (flags & RPC_FLAG_IS_RESPONSE) != 0;
+            if (isResp) {
+                auto it = _streamSessions.find(callId);
+                if (it != _streamSessions.end()) {
+                    it->second->inCh->send(pkt);
+                }
+            } else {
+                auto sessionIt = _streamSessions.find(callId);
+                if (sessionIt == _streamSessions.end()) {
+                    // OPEN packet: new stream from client, spawn handler coroutine.
+                    auto methodIt = _streamMethods.find(methodId);
+                    if (methodIt != _streamMethods.end()) {
+                        RpcStreamSession* session = new RpcStreamSession();
+                        session->streamId       = callId;
+                        session->methodId       = methodId;
+                        session->inCh           = corocgo::makeChannel<RpcPacket>(4);
+                        session->waitDeadlineMs = 0;
+                        _streamSessions[callId] = session;
+                        auto handler = methodIt->second;
+                        corocgo::coro([this, session, handler]() {
+                            RpcStreamServer srv(session, _outCh,
+                                                session->methodId, session->streamId,
+                                                _timeoutMs);
+                            handler(srv);
+                            auto it2 = _streamSessions.find(session->streamId);
+                            if (it2 != _streamSessions.end()) {
+                                it2->second->inCh->close();
+                                delete it2->second->inCh;
+                                delete it2->second;
+                                _streamSessions.erase(it2);
+                            }
+                        });
+                    }
+                } else {
+                    sessionIt->second->inCh->send(pkt);
+                }
+            }
+            continue;
+        }
+#endif // COROCRPC_STREAMING
+
         bool     isResponse = (flags & RPC_FLAG_IS_RESPONSE) != 0;
         bool     noResponse = (flags & RPC_FLAG_NO_RESPONSE) != 0;
         int      payloadLen = pkt.size - RPC_HEADER_SIZE;
@@ -436,6 +738,16 @@ void RpcManager::_timeoutLoop() {
                 corocgo::_monitor_wake(pc->monitor);
             }
         }
+#ifdef COROCRPC_STREAMING
+        for (auto& [streamId, session] : _streamSessions) {
+            if (session->waitDeadlineMs > 0 && now >= session->waitDeadlineMs) {
+                session->waitDeadlineMs = 0;
+                RpcPacket tp = makeStreamPacket(session->methodId, streamId,
+                                                RPC_FLAG_IS_STREAM | RPC_FLAG_STREAM_TIMEOUT);
+                session->inCh->send(tp);
+            }
+        }
+#endif // COROCRPC_STREAMING
     }
 }
 
