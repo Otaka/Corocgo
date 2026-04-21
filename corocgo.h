@@ -201,7 +201,7 @@ public:
         }
         delete[] buffer;
     }
-    bool send(T value) {
+    bool send(const T& value) {
         if(_closed.load(std::memory_order_relaxed)) return false;
         while (count>=bufferSize && !_closed.load(std::memory_order_relaxed)) {
             if (_extEnabled) {
