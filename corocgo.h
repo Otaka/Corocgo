@@ -23,6 +23,13 @@
     #ifndef COROCGO_HAS_FILE_IO
         #define COROCGO_HAS_FILE_IO 0
     #endif
+#elif defined(COROCGO_PLATFORM_WINDOWS)
+    #ifndef COROCGO_HAS_THREADS
+        #define COROCGO_HAS_THREADS 1
+    #endif
+    #ifndef COROCGO_HAS_FILE_IO
+        #define COROCGO_HAS_FILE_IO 0  // Windows has no poll/epoll; use WaitForMultipleObjects or IOCP instead
+    #endif
 #else
     #ifndef COROCGO_HAS_THREADS
         #define COROCGO_HAS_THREADS 1
@@ -109,6 +116,13 @@ bool scheduler_step();
 void scheduler_stop();
 void coro_yield();
 void sleep(int milliseconds);
+
+struct CoroSleepHandler {
+    void* _cor;
+    void sleep() const;
+    void wake() const;
+};
+CoroSleepHandler coro_sleep_wake();
 
 void exec_thread(std::function<void(std::function<void()>)> future);
 std::pair<int,int> wait_file(int fd, int modeBitFlag);

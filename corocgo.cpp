@@ -657,6 +657,27 @@ void exec_thread(function<void(function<void()>)> future) {
 }
 #endif // COROCGO_HAS_THREADS
 
+// ── External wake handler ──
+
+void CoroSleepHandler::sleep() const {
+    mco_yield(mco_running());
+}
+
+void CoroSleepHandler::wake() const {
+    ((Coroutine*)_cor)->moveToRunningQueueExternal();
+}
+
+CoroSleepHandler coro_sleep_wake() {
+    mco_coro* co = mco_running();
+    Coroutine* cor = (Coroutine*)co->user_data;
+    {
+        coro_lock_guard_t<coro_mutex_t> lock(pendingWakeMtx);
+        threadWaitCount++;
+    }
+    cor->moveToWaitingQueue();
+    return CoroSleepHandler{cor};
+}
+
 // ── Coroutine engine ──
 
 static void coroutine_entry(mco_coro* co) {

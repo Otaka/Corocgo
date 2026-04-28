@@ -277,13 +277,65 @@ static void test_wait_file() {
     delete log;
 }
 
+// ── test: coro_sleep_wake / CoroSleepHandler ──────────────────────────────────
+// Simulates an external system (e.g. a GUI framework callback) waking a
+// coroutine.  The coroutine gets a handler, passes the wake side to a thread,
+// and calls sleep() to suspend.  The thread fires wake() after a short delay.
+
+static void test_coro_sleep_wake() {
+    printf("\n[test_coro_sleep_wake]\n");
+
+    // --- basic wake from external thread ---
+    {
+        bool work_done = false;
+        int  result    = 0;
+
+        coro([&]() {
+            CoroSleepHandler h = coro_sleep_wake();
+
+            // Hand the handle to an OS thread (simulates a GUI callback, Qt signal, etc.)
+            thread([h, &work_done, &result]() {
+                this_thread::sleep_for(chrono::milliseconds(1000));
+                work_done = true;
+                result    = 99;
+                h.wake();   // resumes the coroutine from the OS thread
+            }).detach();
+
+            h.sleep();   // suspend — will not run again until h.wake() is called
+
+            check(work_done, "coro_sleep_wake: work completed before coroutine resumed");
+            check(result == 99, "coro_sleep_wake: result value is correct");
+        });
+
+        scheduler_start();
+    }
+
+    // --- wake called before sleep (race-safe) ---
+    {
+        // If the external caller fires wake() before sleep(), the scheduler
+        // must still resume the coroutine exactly once.
+        bool resumed = false;
+
+        coro([&]() {
+            CoroSleepHandler h = coro_sleep_wake();
+            h.wake();    // fire before sleep — should be safe
+            h.sleep();
+            resumed = true;
+        });
+
+        scheduler_start();
+        check(resumed, "coro_sleep_wake: wake-before-sleep still resumes coroutine");
+    }
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 int main() {
-    //test_simple_coroutine();
+    test_simple_coroutine();
     test_channel();
-    //test_external_thread();
-    //test_wait_file();
+    test_external_thread();
+    test_wait_file();
+    test_coro_sleep_wake();
 
     printf("\n──────────────────────────────\n");
     printf("Results: %d passed, %d failed\n", passed, failed);

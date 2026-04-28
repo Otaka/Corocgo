@@ -424,3 +424,45 @@ received from thread: 3
 ```
 
 `sendExternalNoBlock` is non-blocking and returns `false` if the external buffer is full. The caller is responsible for handling backpressure (retry, drop, etc.).
+
+---
+
+### Waking a Coroutine from an External System
+
+`coro_sleep_wake()` returns a `CoroSleepHandler` that owns both sides of the suspend/resume pair. Call `sleep()` on it to suspend the coroutine and `wake()` from any thread to resume it.
+
+```cpp
+coro([]() {
+    CoroSleepHandler h = coro_sleep_wake();
+
+    // Pass the handle to an external system.
+    // CoroSleepHandler is trivially copyable — safe to capture by value in a lambda.
+    some_async_operation([h]() {
+        // called from any thread when the operation completes
+        h.wake();
+    });
+
+    h.sleep();   // suspend here; resumes when h.wake() is called
+    // execution continues here after the external callback fires
+});
+```
+
+Qt example — update a widget from a coroutine:
+
+```cpp
+coro([]() {
+    CoroSleepHandler h = coro_sleep_wake();
+
+    QMetaObject::invokeMethod(qApp, [h]() {
+        label->setText("Hello from coroutine");
+        h.wake();   // resumes the coroutine on the scheduler thread
+    }, Qt::QueuedConnection);
+
+    h.sleep();
+    // label has been updated by the time execution reaches here
+});
+```
+
+**Thread safety.** `wake()` is safe to call from any OS thread. Multiple calls are idempotent — only the first one that finds the coroutine parked will reschedule it.
+
+**Wake before sleep.** Calling `wake()` before `sleep()` is safe. The pending wake is queued and the coroutine resumes on the very next scheduler tick after `sleep()` is called.
