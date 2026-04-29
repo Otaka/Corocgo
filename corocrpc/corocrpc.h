@@ -40,16 +40,21 @@ struct RawChunk {
 // Output value received from readCh (one complete, CRC-validated frame).
 // Sized for RPC use: RPC_PACKET_MAX (~1031 B) + HEADER_SIZE (12 B) + headroom.
 // Increase if you need to frame larger payloads.
-static constexpr size_t SF_BUFFER_SIZE = 2 * 1024;  // max frame (header + content)
+static constexpr size_t SF_BUFFER_SIZE  = 2 * 1024;  // max frame (header + content)
+static constexpr size_t SF_HEADER_SIZE  = 12;         // [Magic:2][ContentSize:2][ContentCRC:2][UserData:2][Channel:2][HeaderCRC:2]
+
 struct FramedPacket {
     uint8_t  data[SF_BUFFER_SIZE];
     uint16_t size;     // total bytes (header + content); 0 = invalid
     uint16_t channel;
+
+    const uint8_t* getData() const { return data + SF_HEADER_SIZE; }
+    uint16_t getDataSize() const { return size - SF_HEADER_SIZE; }
 };
 
 class StreamFramer {
 public:
-    static constexpr size_t HEADER_SIZE = 12;
+    static constexpr size_t HEADER_SIZE = SF_HEADER_SIZE;
 
     // Allocates writeCh and readCh, spawns the internal parse coroutine.
     // Call before scheduler_start().
@@ -286,6 +291,7 @@ public:
     // Pool: obtain a zeroed RpcArg; return it when done.
     RpcArg* getRpcArg();
     void    disposeRpcArg(RpcArg* arg);
+    void    disposeRpcResult(RpcResult& result) { if (result.arg) disposeRpcArg(result.arg); }
 
 private:
     static constexpr int POOL_SIZE = 16;
