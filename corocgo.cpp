@@ -231,6 +231,8 @@ public:
     mco_coro* coroutine=nullptr;
     BiLinkedCell<Coroutine*>* cell=nullptr;
     chrono::steady_clock::time_point wakeUpTime;
+    std::atomic<bool> selectClaimed{false};
+
     // Park this coroutine (remove from whichever queue it's currently in).
     // Must be called from within the coroutine.
     void moveToWaitingQueue();
@@ -264,6 +266,7 @@ void releaseCoroutine(Coroutine* c) {
     c->runnable=nullptr;
     c->coroutine=nullptr;
     c->cell=nullptr;
+    c->selectClaimed.store(false, std::memory_order_relaxed);
     freeCoroutines.push_back(c);
 }
 
@@ -326,6 +329,7 @@ void Coroutine::moveToRunningQueueExternal() {
 
 class WaitQueue {
     BiLinkedList<Coroutine*> waitQueue;
+    BiLinkedList<Coroutine*> selectWaiters;
 public:
     void wait() {
         Coroutine* cor=(Coroutine*)mco_running()->user_data;
@@ -335,8 +339,16 @@ public:
     }
     void wake() {
         BiLinkedCell<Coroutine*>* cell=waitQueue.removeFront();
+        if(cell!=nullptr) { cell->data->moveToRunningQueue(); return; }
+        cell=selectWaiters.removeFront();
         if(cell==nullptr) return;
-        cell->data->moveToRunningQueue();
+        bool expected=false;
+        if(cell->data->selectClaimed.compare_exchange_strong(
+                expected, true,
+                std::memory_order_acq_rel,
+                std::memory_order_relaxed)) {
+            cell->data->moveToRunningQueueExternal();
+        }
     }
     void wakeAll() {
         BiLinkedCell<Coroutine*>* cell=waitQueue.removeFront();
@@ -351,12 +363,19 @@ public:
     void removeWaiter(BiLinkedCell<Coroutine*>* cell) {
         waitQueue.remove(cell);
     }
+    void addSelectWaiter(BiLinkedCell<Coroutine*>* cell) {
+        selectWaiters.append(cell);
+    }
+    void removeSelectWaiter(BiLinkedCell<Coroutine*>* cell) {
+        selectWaiters.remove(cell);
+    }
 };
 
 // ── TSWaitQueue (thread-safe coroutine condition variable) ──
 
 class TSWaitQueue {
     BiLinkedList<Coroutine*> waitQueue;
+    BiLinkedList<Coroutine*> selectWaiters;
     coro_mutex_t mtx;
     std::atomic<int> waitCount{0};
 public:
@@ -397,13 +416,24 @@ public:
     }
     void wakeExternal() {
 #if COROCGO_HAS_THREADS
-        if(waitCount.load(std::memory_order_acquire)==0) return;
         BiLinkedCell<Coroutine*>* cell;
         {
             coro_lock_guard_t<coro_mutex_t> lock(mtx);
             cell=waitQueue.removeFront();
-            if(cell==nullptr) return;
-            waitCount.fetch_sub(1,std::memory_order_release);
+            if(cell!=nullptr) {
+                waitCount.fetch_sub(1,std::memory_order_release);
+            } else {
+                cell=selectWaiters.removeFront();
+                if(cell==nullptr) return;
+                bool expected=false;
+                if(cell->data->selectClaimed.compare_exchange_strong(
+                        expected, true,
+                        std::memory_order_acq_rel,
+                        std::memory_order_relaxed)) {
+                    cell->data->moveToRunningQueueExternal();
+                }
+                return;
+            }
         }
         cell->data->moveToRunningQueueExternal();
 #endif
@@ -426,6 +456,18 @@ public:
             waitCount.store(0,std::memory_order_release);
         }
         schedulerCV.notify_one();
+#endif
+    }
+    void addSelectWaiter(BiLinkedCell<Coroutine*>* cell) {
+#if COROCGO_HAS_THREADS
+        coro_lock_guard_t<coro_mutex_t> lock(mtx);
+        selectWaiters.append(cell);
+#endif
+    }
+    void removeSelectWaiter(BiLinkedCell<Coroutine*>* cell) {
+#if COROCGO_HAS_THREADS
+        coro_lock_guard_t<coro_mutex_t> lock(mtx);
+        selectWaiters.remove(cell);
 #endif
     }
 };
@@ -609,6 +651,58 @@ void _monitor_ts_wake_external(void* monitor) {
 
 void _monitor_ts_wake_all(void* monitor) {
     ((TSWaitQueue*)monitor)->wakeAll();
+}
+
+void _monitor_add_select_waiter(void* monitor, bool isTs, void* cell) {
+    if(isTs)
+        ((TSWaitQueue*)monitor)->addSelectWaiter((BiLinkedCell<Coroutine*>*)cell);
+    else
+        ((WaitQueue*)monitor)->addSelectWaiter((BiLinkedCell<Coroutine*>*)cell);
+}
+
+void _monitor_remove_select_waiter(void* monitor, bool isTs, void* cell) {
+    if(isTs)
+        ((TSWaitQueue*)monitor)->removeSelectWaiter((BiLinkedCell<Coroutine*>*)cell);
+    else
+        ((WaitQueue*)monitor)->removeSelectWaiter((BiLinkedCell<Coroutine*>*)cell);
+}
+
+void _select_wait_mixed(MonitorRef* monitors, int count) {
+    mco_coro* co=mco_running();
+    Coroutine* cor=(Coroutine*)co->user_data;
+
+    BiLinkedCell<Coroutine*>** tempCells=
+        (BiLinkedCell<Coroutine*>**)alloca(count*sizeof(BiLinkedCell<Coroutine*>*));
+    for(int i=0;i<count;i++) {
+        tempCells[i]=acquireCell();
+        tempCells[i]->data=cor;
+    }
+
+    cor->selectClaimed.store(false, std::memory_order_relaxed);
+    {
+        coro_lock_guard_t<coro_mutex_t> lock(pendingWakeMtx);
+        threadWaitCount++;
+    }
+
+    cor->moveToWaitingQueue();
+
+    for(int i=0;i<count;i++) {
+        _monitor_add_select_waiter(monitors[i].monitor, monitors[i].isTs, tempCells[i]);
+    }
+
+    mco_yield(co);
+
+    {
+        coro_lock_guard_t<coro_mutex_t> lock(pendingWakeMtx);
+        threadWaitCount--;
+    }
+
+    for(int i=0;i<count;i++) {
+        if(tempCells[i]->list!=nullptr) {
+            _monitor_remove_select_waiter(monitors[i].monitor, monitors[i].isTs, tempCells[i]);
+        }
+        releaseCell(tempCells[i]);
+    }
 }
 
 // ── Fd wait ──

@@ -328,6 +328,100 @@ static void test_coro_sleep_wake() {
     }
 }
 
+// ── test: select on external channels ────────────────────────────────────────
+
+static void test_select_external() {
+    printf("\n[test_select_external]\n");
+
+    // --- select on a single external channel ---
+    {
+        auto* ch      = makeChannel<int>(4, 4);
+        auto* results = makeChannel<int>(4);
+
+        coro([ch, results]() {
+            exec_thread([ch](auto wake) {
+                this_thread::sleep_for(chrono::milliseconds(10));
+                while(!ch->sendExternalNoBlock(99)) {}
+                wake();
+            });
+            int val = -1;
+            select(Recv(ch, [&](int v){ val = v; }));
+            results->send(val);
+            results->close();
+            ch->close();
+        });
+
+        scheduler_start();
+
+        auto [v, err] = results->tryReceive();
+        check(!err && v == 99, "select on single external channel: received correct value");
+        delete ch;
+        delete results;
+    }
+
+    // --- select mixing regular and external channels ---
+    {
+        auto* regular = makeChannel<int>(4);
+        auto* ext     = makeChannel<int>(4, 4);
+        auto* results = makeChannel<int>(4);
+
+        coro([regular, ext, results]() {
+            exec_thread([ext](auto wake) {
+                this_thread::sleep_for(chrono::milliseconds(10));
+                while(!ext->sendExternalNoBlock(7)) {}
+                wake();
+            });
+            int got = -1;
+            int idx = select(
+                Recv(regular, [&](int v){ got = v * 100; }),
+                Recv(ext,     [&](int v){ got = v; })
+            );
+            results->send(got);
+            results->send(idx);
+            results->close();
+            regular->close();
+            ext->close();
+        });
+
+        scheduler_start();
+
+        auto [val,  e1] = results->tryReceive();
+        auto [idx2, e2] = results->tryReceive();
+        check(!e1 && val  == 7, "mixed select: received from external channel");
+        check(!e2 && idx2 == 1, "mixed select: returned correct case index (1)");
+        delete regular;
+        delete ext;
+        delete results;
+    }
+
+    // --- select with Default case on empty external channel ---
+    {
+        auto* ext     = makeChannel<int>(4, 4);
+        auto* results = makeChannel<int>(4);
+
+        coro([ext, results]() {
+            int got = -1;
+            int idx = select(
+                Recv(ext,  [&](int v){ got = v; }),
+                Default([&]{ got = 0; })
+            );
+            results->send(got);
+            results->send(idx);
+            results->close();
+            ext->close();
+        });
+
+        scheduler_start();
+
+        auto [val,  e1] = results->tryReceive();
+        auto [idx2, e2] = results->tryReceive();
+        check(!e1 && val  == 0,              "select+default on empty ext channel: default fires");
+        check(!e2 && idx2 == SELECT_DEFAULT, "select+default: returned SELECT_DEFAULT");
+        delete ext;
+        delete results;
+    }
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -336,6 +430,7 @@ int main() {
     test_external_thread();
     test_wait_file();
     test_coro_sleep_wake();
+    test_select_external();
 
     printf("\n──────────────────────────────\n");
     printf("Results: %d passed, %d failed\n", passed, failed);

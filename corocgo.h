@@ -147,6 +147,15 @@ void _monitor_add_waiter(void* monitor, void* cell);
 void _monitor_remove_waiter(void* monitor, void* cell);
 void _select_wait(void** monitors, int count);
 
+struct MonitorRef {
+    void* monitor;
+    bool  isTs;
+};
+
+void _monitor_add_select_waiter(void* monitor, bool isTs, void* cell);
+void _monitor_remove_select_waiter(void* monitor, bool isTs, void* cell);
+void _select_wait_mixed(MonitorRef* monitors, int count);
+
 template<typename T>
 struct ChannelResult {
     T value;
@@ -385,22 +394,25 @@ bool allClosed(First& first, Rest&... rest) {
 
 // Collect monitors from RecvCases (skip DefaultCase)
 template<typename Case>
-void collectMonitor(Case& c, void** monitors, int& idx) {
-    assert(!c.channel->isExtEnabled() &&
-        "select does not support channels with external send (extSize>0)");
-    monitors[idx++]=c.channel->getRecvMonitor();
+void collectMonitor(Case& c, MonitorRef* monitors, int& idx) {
+    monitors[idx++]={ c.channel->getRecvMonitor(), c.channel->isExtEnabled() };
 }
-inline void collectMonitor(DefaultCase&, void**, int&) {}
+inline void collectMonitor(DefaultCase&, MonitorRef*, int&) {}
 
 template<typename... Cases>
-void collectMonitors(void** monitors, int& idx, Cases&... cases);
+void collectMonitors(MonitorRef* monitors, int& idx, Cases&... cases);
 
-inline void collectMonitors(void**, int&) {}
+inline void collectMonitors(MonitorRef*, int&) {}
 
 template<typename First, typename... Rest>
-void collectMonitors(void** monitors, int& idx, First& first, Rest&... rest) {
+void collectMonitors(MonitorRef* monitors, int& idx, First& first, Rest&... rest) {
     collectMonitor(first, monitors, idx);
     collectMonitors(monitors, idx, rest...);
+}
+
+inline bool anyTs(MonitorRef* monitors, int count) {
+    for(int i=0;i<count;i++) if(monitors[i].isTs) return true;
+    return false;
 }
 
 // Count RecvCases (exclude DefaultCase)
@@ -428,7 +440,12 @@ int select(Last last) {
             if(!r.error) { last.handler(r.value); return 0; }
             if(last.channel->isClosed()) return SELECT_CLOSED;
             void* mon=last.channel->getRecvMonitor();
-            _select_wait(&mon, 1);
+            if(last.channel->isExtEnabled()) {
+                MonitorRef ref{mon, true};
+                _select_wait_mixed(&ref, 1);
+            } else {
+                _select_wait(&mon, 1);
+            }
         }
     }
 }
@@ -451,10 +468,16 @@ int select(Cases... cases) {
             return SELECT_DEFAULT;
         }
 
-        void* monitors[N];
+        MonitorRef monitors[N];
         int mIdx=0;
         _select_detail::collectMonitors(monitors, mIdx, cases...);
-        _select_wait(monitors, N);
+        if(_select_detail::anyTs(monitors, N)) {
+            _select_wait_mixed(monitors, N);
+        } else {
+            void* rawMons[N];
+            for(int i=0;i<N;i++) rawMons[i]=monitors[i].monitor;
+            _select_wait(rawMons, N);
+        }
     }
 }
 
