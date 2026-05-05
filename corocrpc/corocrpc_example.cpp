@@ -661,6 +661,130 @@ static void testStreamingSendAll() {
 }
 #endif // COROCRPC_STREAMING
 
+// ── CRC32 helper (used by stress test) ───────────────────────────────────
+static uint32_t crc32(const uint8_t* data, size_t len) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++)
+            crc = (crc >> 1) ^ (0xEDB88320u & -(crc & 1u));
+    }
+    return ~crc;
+}
+
+#ifdef COROCRPC_STREAMING
+// ── Test 11: Stress loop — 500 iterations of call + callNoResponse + callStreamed ──
+static void testStressLoop500() {
+    std::cout << "\n=== Test 11: Stress loop (500 iterations) ===\n";
+
+    scheduler_init();
+
+    auto* aTob = makeChannel<RpcPacket>(16);
+    auto* bToa = makeChannel<RpcPacket>(16);
+
+    RpcManager server(aTob, bToa, 5000);
+    RpcManager client(bToa, aTob, 5000);
+
+    server.registerMethod(METHOD_ADD, [&server](RpcArg* arg) -> RpcArg* {
+        int32_t a = arg->getInt32();
+        int32_t b = arg->getInt32();
+        RpcArg* out = server.getRpcArg();
+        out->putInt32(a + b);
+        return out;
+    });
+
+    server.registerMethod(METHOD_NOTIFY_NO_RESPONSE, [](RpcArg*) -> RpcArg* {
+        return nullptr;
+    });
+
+    server.registerStreamedMethod(METHOD_STREAM_ECHO, [](RpcStreamServer& s) {
+        std::vector<uint8_t> received;
+        uint8_t chunk[RPC_STREAM_CHUNK_SIZE];
+        while (true) {
+            RpcStreamState st = s.waitReadyReceive();
+            if (st == RpcStreamState::RECEIVE_FINISH) break;
+            if (st != RpcStreamState::RECEIVE_READY) return;
+            int n = s.receive(chunk, sizeof(chunk));
+            received.insert(received.end(), chunk, chunk + n);
+        }
+        s.sendAll(received.data(), (int)received.size());
+    });
+
+    constexpr int ITERATIONS  = 500;
+    constexpr int STREAM_SIZE = 200*1024;
+
+    coro([&client, aTob, bToa]() {
+        std::vector<uint8_t> testData(STREAM_SIZE);
+        for (int i = 0; i < STREAM_SIZE; i++) testData[i] = (uint8_t)(i & 0xFF);
+        const uint32_t expectedCrc = crc32(testData.data(), STREAM_SIZE);
+
+        int addFailed = 0, streamSizeFailed = 0, streamCrcFailed = 0;
+
+        for (int iter = 0; iter < ITERATIONS; iter++) {
+            // 1. Regular call
+            {
+                RpcArg* arg = client.getRpcArg();
+                arg->putInt32(iter);
+                arg->putInt32(1);
+                RpcResult res = client.call(METHOD_ADD, arg);
+                client.disposeRpcArg(arg);
+                if (res.error != RPC_OK || res.arg->getInt32() != iter + 1) {
+                    addFailed++;
+                    std::cout << "  [add fail] iter=" << iter
+                              << " error=" << res.error << "\n";
+                }
+                if (res.error == RPC_OK) client.disposeRpcArg(res.arg);
+            }
+
+            // 2. callNoResponse
+            {
+                RpcArg* arg = client.getRpcArg();
+                arg->putInt32(iter);
+                client.callNoResponse(METHOD_NOTIFY_NO_RESPONSE, arg);
+                client.disposeRpcArg(arg);
+            }
+
+            // 3. Streaming call with 2 KB buffer — verified by CRC32
+            {
+                RpcStreamClient sh = client.callStreamed(METHOD_STREAM_ECHO);
+                sh.sendAll(testData.data(), STREAM_SIZE);
+                std::vector<uint8_t> response = sh.receiveAll();
+                if ((int)response.size() != STREAM_SIZE) {
+                    streamSizeFailed++;
+                    std::cout << "  [stream size fail] iter=" << iter
+                              << " got=" << response.size() << "\n";
+                } else {
+                    uint32_t gotCrc = crc32(response.data(), response.size());
+                    if (gotCrc != expectedCrc) {
+                        streamCrcFailed++;
+                        std::cout << "  [stream crc fail] iter=" << iter
+                                  << " expected=0x" << std::hex << expectedCrc
+                                  << " got=0x" << gotCrc << std::dec << "\n";
+                    }
+                }
+            }
+
+            if ((iter + 1) % 100 == 0)
+                std::cout << "  iter " << (iter + 1) << "/" << ITERATIONS << "\n";
+        }
+
+        check("stress/add: all 500 iterations ok",         addFailed == 0);
+        check("stress/stream size: all 500 iterations ok", streamSizeFailed == 0);
+        check("stress/stream crc: all 500 iterations ok",  streamCrcFailed == 0);
+        if (addFailed)        std::cout << "  add failures: "          << addFailed        << "\n";
+        if (streamSizeFailed) std::cout << "  stream size failures: "  << streamSizeFailed << "\n";
+        if (streamCrcFailed)  std::cout << "  stream crc failures: "   << streamCrcFailed  << "\n";
+
+        aTob->close();
+        bToa->close();
+    });
+
+    scheduler_start();
+    delete aTob;
+    delete bToa;
+}
+#endif // COROCRPC_STREAMING
+
 // ── Main ──────────────────────────────────────────────────────────────────
 
 int main() {
@@ -769,6 +893,9 @@ int main() {
 
     // Test 10: Streaming sendAll/receiveAll
     testStreamingSendAll();
+
+    // Test 11: Stress loop (500 iterations of call + callNoResponse + callStreamed)
+    testStressLoop500();
 #endif // COROCRPC_STREAMING
 
     // ── Summary ───────────────────────────────────────────────────────────
