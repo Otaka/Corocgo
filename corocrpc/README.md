@@ -6,7 +6,7 @@ A coroutine-native RPC library for C++17 built on [corocgo].
 
 | File | Purpose |
 |------|---------|
-| `corocrpc.h` | Public API: `RpcArg`, `RpcPacket`, `RpcResult`, `RpcManager`, `StreamFramer`, `Packet` |
+| `corocrpc.h` | Public API: `RpcArg`, `RpcPacket`, `RpcResult`, `RpcManager`, `StreamFramer`, `Packet`, `ChunkedRpcArg`, `ChunkedRpcManagerWrapper` |
 | `corocrpc.cpp` | Implementation |
 | `corocrpc_example.cpp` | Tests / usage examples |
 
@@ -321,95 +321,132 @@ The `RpcManager` internal coroutines observe `inCh->isClosed()` and exit on thei
 
 ---
 
----
+## ChunkedRpc
 
-## Streaming Mode
+`ChunkedRpcManagerWrapper` is a wrapper around `RpcManager` that supports arbitrarily large request and response payloads. It sits entirely on top of normal `RpcManager::call()` round-trips, splitting payloads into 512-byte chunks and reassembling them on the other side. Each chunk is an ordinary, idempotent RPC; lost chunks are retried automatically.
 
-Enable with `#define COROCRPC_STREAMING` (or `-DCOROCRPC_STREAMING` on the compiler command line / Xcode preprocessor macros).
+### Characteristics
 
-Streaming transfers arbitrarily large payloads that exceed the 1 KB `RpcArg` limit. Data flows as 512-byte chunks with receiver-driven flow control — the receiver signals readiness before each chunk so the sender never blocks the transport. A `corocgo::sleep(0)` yield after every chunk keeps regular `call()` latency unaffected.
+- Payload size is unbounded (`ChunkedRpcArg` is backed by `std::vector<uint8_t>`).
+- Only the client initiates a session; the server replies inline. Server cannot push data spontaneously.
+- Per-chunk retry on `RPC_TIMEOUT` (default 3 retries). Server keeps idle sessions alive for `4 × rpc.timeoutMs` by default and GCs them periodically.
+- The handler runs **inline** on the dispatch coroutine after the full request arrives — it must not block.
+- Multiple coroutines may call `callChunked()` concurrently; sessions are independent.
 
-### Registering a streaming method (server side)
+### ChunkedRpcArg
 
-The handler runs in its own spawned coroutine, so a slow transfer never delays regular RPC dispatch.
+Same put/get style as `RpcArg`, but with no fixed size limit:
 
 ```cpp
-rpc.registerStreamedMethod(METHOD_ID, [](RpcStreamServer& s) {
-    // ── Receive phase ──────────────────────────────────────────
-    std::vector<uint8_t> received;
-    uint8_t chunk[512];
-    while (true) {
-        RpcStreamState st = s.waitReadyReceive();   // sends READY, then waits for chunk
-        if (st == RpcStreamState::RECEIVE_FINISH) break;
-        if (st != RpcStreamState::RECEIVE_READY)  return;  // abort/timeout
-        int n = s.receive(chunk, sizeof(chunk));
-        received.insert(received.end(), chunk, chunk + n);
-    }
+ChunkedRpcArg* arg = chunked.getChunkedArg();
+arg->putInt32(42);
+arg->putBool(true);
+arg->putString("hello");
+arg->putBuffer(ptr, len);
 
-    // ── Send phase ─────────────────────────────────────────────
-    // process received data, then send response
-    s.sendAll(responseData, responseSize);  // helper: loops chunks + finishSend
-});
+int32_t  v = arg->getInt32();
+bool     b = arg->getBool();
+char     s[64]; arg->getString(s, sizeof(s));
+uint8_t  buf[256]; arg->getBuffer(buf, sizeof(buf));
+
+chunked.disposeChunkedArg(arg);
 ```
 
-### Making a streaming call (client side)
+### Server side
 
 ```cpp
-RpcStreamClient sh = rpc.callStreamed(METHOD_ID);  // must run from a coroutine
+ChunkedRpcManagerWrapper chunked(&rpc);
 
-// Send a large buffer
-sh.sendAll(requestData, requestSize);
+chunked.registerChunkedMethod(METHOD_BIG_ECHO,
+    [&chunked](ChunkedRpcArg* in) -> ChunkedRpcArg* {
+        // Read whatever the client sent
+        uint8_t buf[64 * 1024];
+        uint32_t n = in->getBuffer(buf, sizeof(buf));
 
-// Receive the response
-std::vector<uint8_t> response = sh.receiveAll();
+        // Build a (potentially large) response
+        ChunkedRpcArg* out = chunked.getChunkedArg();
+        out->putBuffer(buf, n);
+        return out;
+        // Wrapper disposes both `in` and `out` after the response is fully delivered.
+    });
 ```
 
-### Manual chunk loop (for progress tracking or partial reads)
+Returning `nullptr` signals an empty response (still delivered as `RPC_OK`).
+
+### Client side
 
 ```cpp
-RpcStreamClient sh = rpc.callStreamed(METHOD_ID);
+// Must run from a coroutine.
+ChunkedRpcArg* arg = chunked.getChunkedArg();
+arg->putBuffer(largePayload, largeSize);
 
-// Send phase
-int offset = 0;
-while (offset < totalSize) {
-    if (sh.waitReadySend() != RpcStreamState::SEND_READY) return;  // abort/timeout
-    offset += sh.send(buf, totalSize, offset);  // sends up to 512 bytes, returns count
+ChunkedRpcResult res = chunked.callChunked(METHOD_BIG_ECHO, arg);
+chunked.disposeChunkedArg(arg);
+
+if (res.error == RPC_OK) {
+    uint8_t out[64 * 1024];
+    uint32_t n = res.arg->getBuffer(out, sizeof(out));
+    chunked.disposeChunkedArg(res.arg);
+} else if (res.error == RPC_TIMEOUT) {
+    // Exhausted maxChunkRetries on some chunk.
+} else if (res.error == RPC_CHUNKED_ERROR) {
+    // res.chunkedErrorCode + res.errorMessage describe the server-side error.
 }
-sh.finishSend();
-
-// Receive phase
-uint8_t chunk[512];
-while (true) {
-    RpcStreamState st = sh.waitReadyReceive();
-    if (st == RpcStreamState::RECEIVE_FINISH) break;
-    if (st != RpcStreamState::RECEIVE_READY)  break;  // abort/timeout
-    int n = sh.receive(chunk, sizeof(chunk));
-    // ... process chunk ...
-}
 ```
 
-### RpcStreamState values
+### Constructor
 
-| Value | Meaning |
-|---|---|
-| `SEND_READY` | Receiver sent READY — call `send()` |
-| `RECEIVE_READY` | Data chunk arrived — call `receive()` |
-| `RECEIVE_FINISH` | Sender called `finishSend()` — no more data |
-| `ABORTED` | Either side called `cancel()`, or an ABORT packet arrived |
-| `TIMEOUT` | Wait exceeded the timeout |
-
-### Cancellation
-
-Either side may call `cancel()` at any point. The other side's next `wait*()` call returns `ABORTED`.
-
-### Build with streaming enabled
-
-```bash
-clang++ -std=c++17 -DCOROCRPC_STREAMING corocgo.cpp corocrpc.cpp corocrpc_example.cpp -o test_rpc
-./test_rpc
+```cpp
+ChunkedRpcManagerWrapper(RpcManager* rpc,
+                         int sessionTimeoutMs = -1,   // -1 → 4 × rpc.timeoutMs
+                         int maxChunkRetries  = 3);
 ```
 
-In Xcode: **Build Settings → Preprocessor Macros → add `COROCRPC_STREAMING`**.
+| Param | Meaning |
+|-------|---------|
+| `sessionTimeoutMs` | How long the server keeps an idle session before GC. Must be larger than `maxChunkRetries × rpc.timeoutMs` so the client can exhaust its retries. |
+| `maxChunkRetries` | Per-chunk retry count on `RPC_TIMEOUT`. After exhaustion the client drops its session and returns `RPC_TIMEOUT`. |
+
+### Result codes
+
+| Code | Meaning |
+|------|---------|
+| `RPC_OK` | Success; `res.arg` holds the response (may be empty) |
+| `RPC_TIMEOUT` | A chunk failed `maxChunkRetries` times |
+| `RPC_CLOSED` | Underlying channel closed mid-call |
+| `RPC_CHUNKED_ERROR` | Server replied with an error; see `chunkedErrorCode` and `errorMessage` |
+
+Server-side error codes (`chunkedErrorCode`):
+
+| Code | Meaning |
+|------|---------|
+| `1` `ERR_UNKNOWN_SESSION` | Server has no record of the session (likely GC'd) |
+| `2` `ERR_BAD_OFFSET` | Offset/length out of range |
+| `3` `ERR_INTERNAL` | Protocol/state inconsistency (e.g., conflicting `TOTAL_SIZE` on retransmit) |
+
+### Wire format
+
+Each chunk is the payload of an ordinary `rpc.call()`:
+
+```
+Request:  CHUNK_TYPE:1  SESSION_ID:4  PAYLOAD_SIZE:2  <type-specific body>
+Response: RESP_TYPE:1   SESSION_ID:4  PAYLOAD_SIZE:2  <type-specific body>
+```
+
+Request types: `START` (1), `CONTINUE_REQ` (2), `FINISH` (3), `NEXT_RESPONSE` (5).
+Response types: `WAITING_FOR_DATA` (10), `RESPONSE_CHUNK` (11), `ERROR` (12), `FINISH_ACK` (13).
+
+Max chunk payload is 512 bytes — well under `RPC_ARG_BUF_SIZE` (1024).
+
+### Shutdown
+
+Before closing the underlying channels, call `chunked.stop()` so the GC coroutine can exit cleanly.
+
+```cpp
+chunked.stop();
+outCh->close();
+inCh->close();
+```
 
 ---
 

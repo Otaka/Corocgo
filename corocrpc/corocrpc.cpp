@@ -278,225 +278,6 @@ static int64_t nowMs() {
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-#ifdef COROCRPC_STREAMING
-
-// ── Stream helpers ────────────────────────────────────────────────────────
-
-static RpcPacket makeStreamPacket(uint16_t methodId, uint32_t streamId,
-                                   uint8_t flags,
-                                   const uint8_t* payload = nullptr,
-                                   int payloadLen = 0) {
-    RpcPacket pkt{};
-    pkt.data[0] = (uint8_t)(methodId & 0xFF);
-    pkt.data[1] = (uint8_t)(methodId >> 8);
-    pkt.data[2] = (uint8_t)(streamId & 0xFF);
-    pkt.data[3] = (uint8_t)((streamId >> 8) & 0xFF);
-    pkt.data[4] = (uint8_t)((streamId >> 16) & 0xFF);
-    pkt.data[5] = (uint8_t)((streamId >> 24) & 0xFF);
-    pkt.data[6] = flags;
-    if (payload && payloadLen > 0)
-        memcpy(&pkt.data[RPC_HEADER_SIZE], payload, payloadLen);
-    pkt.size = (uint16_t)(RPC_HEADER_SIZE + payloadLen);
-    return pkt;
-}
-
-// ── RpcStreamClient ───────────────────────────────────────────────────────
-
-RpcStreamClient::RpcStreamClient(RpcStreamSession* session,
-                                  corocgo::Channel<RpcPacket>* outCh,
-                                  uint16_t methodId,
-                                  uint32_t streamId,
-                                  int timeoutMs,
-                                  std::function<void(uint32_t)> cleanup)
-    : _session(session), _outCh(outCh), _methodId(methodId),
-      _streamId(streamId), _timeoutMs(timeoutMs),
-      _sendFinished(false), _hasPendingPacket(false),
-      _cleanup(std::move(cleanup)) {}
-
-RpcStreamState RpcStreamClient::waitReadySend(int timeoutMs) {
-    int tms = (timeoutMs < 0) ? _timeoutMs : timeoutMs;
-    _session->waitDeadlineMs = nowMs() + tms;
-    auto res = _session->inCh->receive();
-    _session->waitDeadlineMs = 0;
-    if (res.error) return RpcStreamState::ABORTED;
-    uint8_t flags = res.value.data[6];
-    if (flags & RPC_FLAG_STREAM_TIMEOUT) return RpcStreamState::TIMEOUT;
-    if (flags & RPC_FLAG_STREAM_ABORT)   return RpcStreamState::ABORTED;
-    if (flags & RPC_FLAG_STREAM_READY)   return RpcStreamState::SEND_READY;
-    return RpcStreamState::ABORTED;
-}
-
-int RpcStreamClient::send(const uint8_t* buf, int size, int offset) {
-    int remaining = size - offset;
-    int toSend = (remaining > RPC_STREAM_CHUNK_SIZE) ? RPC_STREAM_CHUNK_SIZE : remaining;
-    RpcPacket pkt = makeStreamPacket(_methodId, _streamId,
-                                      RPC_FLAG_IS_STREAM,
-                                      buf + offset, toSend);
-    _outCh->send(pkt);
-    corocgo::sleep(0);
-    return toSend;
-}
-
-void RpcStreamClient::finishSend() {
-    if (_sendFinished) return;
-    _sendFinished = true;
-    RpcPacket pkt = makeStreamPacket(_methodId, _streamId,
-                                      RPC_FLAG_IS_STREAM | RPC_FLAG_STREAM_END);
-    _outCh->send(pkt);
-}
-
-RpcStreamState RpcStreamClient::waitReadyReceive(int timeoutMs) {
-    RpcPacket ready = makeStreamPacket(_methodId, _streamId,
-                                        RPC_FLAG_IS_STREAM | RPC_FLAG_STREAM_READY);
-    _outCh->send(ready);
-
-    int tms = (timeoutMs < 0) ? _timeoutMs : timeoutMs;
-    _session->waitDeadlineMs = nowMs() + tms;
-    auto res = _session->inCh->receive();
-    _session->waitDeadlineMs = 0;
-    if (res.error) return RpcStreamState::ABORTED;
-    _pendingPacket    = res.value;
-    _hasPendingPacket = true;
-    uint8_t flags = res.value.data[6];
-    if (flags & RPC_FLAG_STREAM_TIMEOUT) return RpcStreamState::TIMEOUT;
-    if (flags & RPC_FLAG_STREAM_ABORT)   return RpcStreamState::ABORTED;
-    if (flags & RPC_FLAG_STREAM_END) {
-        _cleanup(_streamId);
-        return RpcStreamState::RECEIVE_FINISH;
-    }
-    return RpcStreamState::RECEIVE_READY;
-}
-
-int RpcStreamClient::receive(uint8_t* buf, int maxSize) {
-    if (!_hasPendingPacket) return 0;
-    _hasPendingPacket = false;
-    int payloadLen = _pendingPacket.size - RPC_HEADER_SIZE;
-    if (payloadLen <= 0) return 0;
-    int toCopy = (payloadLen < maxSize) ? payloadLen : maxSize;
-    memcpy(buf, &_pendingPacket.data[RPC_HEADER_SIZE], toCopy);
-    return toCopy;
-}
-
-void RpcStreamClient::cancel() {
-    RpcPacket pkt = makeStreamPacket(_methodId, _streamId,
-                                      RPC_FLAG_IS_STREAM | RPC_FLAG_STREAM_ABORT);
-    _outCh->send(pkt);
-    _cleanup(_streamId);
-}
-
-void RpcStreamClient::sendAll(const uint8_t* buf, int size) {
-    int offset = 0;
-    while (offset < size) {
-        RpcStreamState st = waitReadySend();
-        if (st != RpcStreamState::SEND_READY) return;
-        offset += send(buf, size, offset);
-    }
-    finishSend();
-}
-
-std::vector<uint8_t> RpcStreamClient::receiveAll() {
-    std::vector<uint8_t> result;
-    uint8_t chunk[RPC_STREAM_CHUNK_SIZE];
-    while (true) {
-        RpcStreamState st = waitReadyReceive();
-        if (st == RpcStreamState::RECEIVE_FINISH) break;
-        if (st != RpcStreamState::RECEIVE_READY)  break;
-        int n = receive(chunk, sizeof(chunk));
-        result.insert(result.end(), chunk, chunk + n);
-    }
-    return result;
-}
-
-// ── RpcStreamServer ───────────────────────────────────────────────────────
-
-RpcStreamServer::RpcStreamServer(RpcStreamSession* session,
-                                  corocgo::Channel<RpcPacket>* outCh,
-                                  uint16_t methodId,
-                                  uint32_t streamId,
-                                  int timeoutMs)
-    : _session(session), _outCh(outCh), _methodId(methodId),
-      _streamId(streamId), _timeoutMs(timeoutMs),
-      _sendFinished(false), _hasPendingPacket(false) {}
-
-RpcStreamState RpcStreamServer::waitReadyReceive(int timeoutMs) {
-    RpcPacket ready = makeStreamPacket(_methodId, _streamId,
-                                        RPC_FLAG_IS_STREAM | RPC_FLAG_IS_RESPONSE | RPC_FLAG_STREAM_READY);
-    _outCh->send(ready);
-
-    int tms = (timeoutMs < 0) ? _timeoutMs : timeoutMs;
-    _session->waitDeadlineMs = nowMs() + tms;
-    auto res = _session->inCh->receive();
-    _session->waitDeadlineMs = 0;
-    if (res.error) return RpcStreamState::ABORTED;
-    _pendingPacket    = res.value;
-    _hasPendingPacket = true;
-    uint8_t flags = res.value.data[6];
-    if (flags & RPC_FLAG_STREAM_TIMEOUT) return RpcStreamState::TIMEOUT;
-    if (flags & RPC_FLAG_STREAM_ABORT)   return RpcStreamState::ABORTED;
-    if (flags & RPC_FLAG_STREAM_END)     return RpcStreamState::RECEIVE_FINISH;
-    return RpcStreamState::RECEIVE_READY;
-}
-
-int RpcStreamServer::receive(uint8_t* buf, int maxSize) {
-    if (!_hasPendingPacket) return 0;
-    _hasPendingPacket = false;
-    int payloadLen = _pendingPacket.size - RPC_HEADER_SIZE;
-    if (payloadLen <= 0) return 0;
-    int toCopy = (payloadLen < maxSize) ? payloadLen : maxSize;
-    memcpy(buf, &_pendingPacket.data[RPC_HEADER_SIZE], toCopy);
-    return toCopy;
-}
-
-RpcStreamState RpcStreamServer::waitReadySend(int timeoutMs) {
-    int tms = (timeoutMs < 0) ? _timeoutMs : timeoutMs;
-    _session->waitDeadlineMs = nowMs() + tms;
-    auto res = _session->inCh->receive();
-    _session->waitDeadlineMs = 0;
-    if (res.error) return RpcStreamState::ABORTED;
-    uint8_t flags = res.value.data[6];
-    if (flags & RPC_FLAG_STREAM_TIMEOUT) return RpcStreamState::TIMEOUT;
-    if (flags & RPC_FLAG_STREAM_ABORT)   return RpcStreamState::ABORTED;
-    if (flags & RPC_FLAG_STREAM_READY)   return RpcStreamState::SEND_READY;
-    return RpcStreamState::ABORTED;
-}
-
-int RpcStreamServer::send(const uint8_t* buf, int size, int offset) {
-    int remaining = size - offset;
-    int toSend = (remaining > RPC_STREAM_CHUNK_SIZE) ? RPC_STREAM_CHUNK_SIZE : remaining;
-    RpcPacket pkt = makeStreamPacket(_methodId, _streamId,
-                                      RPC_FLAG_IS_STREAM | RPC_FLAG_IS_RESPONSE,
-                                      buf + offset, toSend);
-    _outCh->send(pkt);
-    corocgo::sleep(0);
-    return toSend;
-}
-
-void RpcStreamServer::finishSend() {
-    if (_sendFinished) return;
-    _sendFinished = true;
-    RpcPacket pkt = makeStreamPacket(_methodId, _streamId,
-                                      RPC_FLAG_IS_STREAM | RPC_FLAG_IS_RESPONSE | RPC_FLAG_STREAM_END);
-    _outCh->send(pkt);
-}
-
-void RpcStreamServer::cancel() {
-    RpcPacket pkt = makeStreamPacket(_methodId, _streamId,
-                                      RPC_FLAG_IS_STREAM | RPC_FLAG_IS_RESPONSE | RPC_FLAG_STREAM_ABORT);
-    _outCh->send(pkt);
-}
-
-void RpcStreamServer::sendAll(const uint8_t* buf, int size) {
-    int offset = 0;
-    while (offset < size) {
-        RpcStreamState st = waitReadySend();
-        if (st != RpcStreamState::SEND_READY) return;
-        offset += send(buf, size, offset);
-    }
-    finishSend();
-}
-
-#endif // COROCRPC_STREAMING
-
 // ── RpcManager ────────────────────────────────────────────────────────────
 
 int64_t RpcManager::_nowMs() { return nowMs(); }
@@ -591,41 +372,6 @@ void RpcManager::callNoResponse(uint16_t methodId, RpcArg* arg) {
     _outCh->send(pkt);
 }
 
-#ifdef COROCRPC_STREAMING
-RpcStreamClient RpcManager::callStreamed(uint16_t methodId) {
-    uint32_t streamId = _nextCallId++;
-
-    RpcStreamSession* session = new RpcStreamSession();
-    session->streamId       = streamId;
-    session->methodId       = methodId;
-    session->inCh           = corocgo::makeChannel<RpcPacket>(4);
-    session->waitDeadlineMs = 0;
-    _streamSessions[streamId] = session;
-
-    RpcPacket open = makeStreamPacket(methodId, streamId, RPC_FLAG_IS_STREAM);
-    _outCh->send(open);
-
-    auto cleanup = [this](uint32_t id) {
-        auto it = _streamSessions.find(id);
-        if (it != _streamSessions.end()) {
-            it->second->inCh->close();
-            delete it->second->inCh;
-            delete it->second;
-            _streamSessions.erase(it);
-        }
-    };
-
-    return RpcStreamClient(session, _outCh, methodId, streamId, _timeoutMs,
-                           std::move(cleanup));
-}
-
-void RpcManager::registerStreamedMethod(
-        uint16_t methodId,
-        std::function<void(RpcStreamServer&)> handler) {
-    _streamMethods[methodId] = std::move(handler);
-}
-#endif // COROCRPC_STREAMING
-
 void RpcManager::_dispatchLoop() {
     while (_running) {
         auto res = _inCh->receive();
@@ -638,49 +384,6 @@ void RpcManager::_dispatchLoop() {
         uint32_t callId     = (uint32_t)(pkt.data[2] | (pkt.data[3] << 8) |
                                          (pkt.data[4] << 16) | (pkt.data[5] << 24));
         uint8_t  flags      = pkt.data[6];
-
-#ifdef COROCRPC_STREAMING
-        if (flags & RPC_FLAG_IS_STREAM) {
-            bool isResp = (flags & RPC_FLAG_IS_RESPONSE) != 0;
-            if (isResp) {
-                auto it = _streamSessions.find(callId);
-                if (it != _streamSessions.end()) {
-                    it->second->inCh->send(pkt);
-                }
-            } else {
-                auto sessionIt = _streamSessions.find(callId);
-                if (sessionIt == _streamSessions.end()) {
-                    // OPEN packet: new stream from client, spawn handler coroutine.
-                    auto methodIt = _streamMethods.find(methodId);
-                    if (methodIt != _streamMethods.end()) {
-                        RpcStreamSession* session = new RpcStreamSession();
-                        session->streamId       = callId;
-                        session->methodId       = methodId;
-                        session->inCh           = corocgo::makeChannel<RpcPacket>(4);
-                        session->waitDeadlineMs = 0;
-                        _streamSessions[callId] = session;
-                        auto handler = methodIt->second;
-                        corocgo::coro([this, session, handler]() {
-                            RpcStreamServer srv(session, _outCh,
-                                                session->methodId, session->streamId,
-                                                _timeoutMs);
-                            handler(srv);
-                            auto it2 = _streamSessions.find(session->streamId);
-                            if (it2 != _streamSessions.end()) {
-                                it2->second->inCh->close();
-                                delete it2->second->inCh;
-                                delete it2->second;
-                                _streamSessions.erase(it2);
-                            }
-                        });
-                    }
-                } else {
-                    sessionIt->second->inCh->send(pkt);
-                }
-            }
-            continue;
-        }
-#endif // COROCRPC_STREAMING
 
         bool     isResponse = (flags & RPC_FLAG_IS_RESPONSE) != 0;
         bool     noResponse = (flags & RPC_FLAG_NO_RESPONSE) != 0;
@@ -738,16 +441,462 @@ void RpcManager::_timeoutLoop() {
                 corocgo::_monitor_wake(pc->monitor);
             }
         }
-#ifdef COROCRPC_STREAMING
-        for (auto& [streamId, session] : _streamSessions) {
-            if (session->waitDeadlineMs > 0 && now >= session->waitDeadlineMs) {
-                session->waitDeadlineMs = 0;
-                RpcPacket tp = makeStreamPacket(session->methodId, streamId,
-                                                RPC_FLAG_IS_STREAM | RPC_FLAG_STREAM_TIMEOUT);
-                session->inCh->send(tp);
+    }
+}
+
+
+// ── ChunkedRpc implementation ────────────────────────────────────────────
+
+static void wr_u32_le(std::vector<uint8_t>& b, uint32_t v) {
+    for (int i = 0; i < 4; i++) b.push_back(static_cast<uint8_t>((v >> (i * 8)) & 0xFF));
+}
+static uint32_t rd_u32_le(const uint8_t* p) {
+    return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+}
+
+void ChunkedRpcArg::reset() { _buf.clear(); _readIdx = 0; }
+
+void ChunkedRpcArg::putInt32(int32_t v) { wr_u32_le(_buf, static_cast<uint32_t>(v)); }
+void ChunkedRpcArg::putBool(bool v)     { _buf.push_back(v ? 1 : 0); }
+
+void ChunkedRpcArg::putString(const char* s) {
+    uint32_t n = static_cast<uint32_t>(std::strlen(s));
+    putBuffer(s, n);
+}
+
+void ChunkedRpcArg::putBuffer(const void* data, uint32_t len) {
+    wr_u32_le(_buf, len);
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    _buf.insert(_buf.end(), p, p + len);
+}
+
+int32_t ChunkedRpcArg::getInt32() {
+    if (_readIdx + 4 > _buf.size()) return 0;
+    int32_t v = static_cast<int32_t>(rd_u32_le(&_buf[_readIdx]));
+    _readIdx += 4;
+    return v;
+}
+
+bool ChunkedRpcArg::getBool() {
+    if (_readIdx + 1 > _buf.size()) return false;
+    return _buf[_readIdx++] != 0;
+}
+
+int ChunkedRpcArg::getString(char* out, int outSize) {
+    if (_readIdx + 4 > _buf.size()) return -1;
+    uint32_t n = rd_u32_le(&_buf[_readIdx]);
+    if (_readIdx + 4 + n > _buf.size()) return -1;
+    int copy = (n < static_cast<uint32_t>(outSize - 1)) ? static_cast<int>(n) : outSize - 1;
+    std::memcpy(out, &_buf[_readIdx + 4], copy);
+    out[copy] = '\0';
+    _readIdx += 4 + n;
+    return static_cast<int>(n);
+}
+
+uint32_t ChunkedRpcArg::getBuffer(void* out, uint32_t maxLen) {
+    if (_readIdx + 4 > _buf.size()) return 0;
+    uint32_t n = rd_u32_le(&_buf[_readIdx]);
+    if (_readIdx + 4 + n > _buf.size()) return 0;
+    uint32_t copy = n < maxLen ? n : maxLen;
+    std::memcpy(out, &_buf[_readIdx + 4], copy);
+    _readIdx += 4 + n;
+    return copy;
+}
+
+namespace chunked_wire {
+
+int packChunk(RpcArg* outArg, uint8_t type, uint32_t sessionId,
+              const uint8_t* body, uint16_t bodyLen) {
+    outArg->reset();
+    uint8_t* b = reinterpret_cast<uint8_t*>(outArg->buf);
+    int o = 0;
+    b[o++] = type;
+    b[o++] = static_cast<uint8_t>(sessionId & 0xFF);
+    b[o++] = static_cast<uint8_t>((sessionId >> 8) & 0xFF);
+    b[o++] = static_cast<uint8_t>((sessionId >> 16) & 0xFF);
+    b[o++] = static_cast<uint8_t>((sessionId >> 24) & 0xFF);
+    b[o++] = static_cast<uint8_t>(bodyLen & 0xFF);
+    b[o++] = static_cast<uint8_t>((bodyLen >> 8) & 0xFF);
+    if (body && bodyLen > 0) { std::memcpy(b + o, body, bodyLen); o += bodyLen; }
+    outArg->writeIdx = o;
+    return o;
+}
+
+bool parseChunkHeader(RpcArg* inArg,
+                      uint8_t* type, uint32_t* sessionId,
+                      const uint8_t** bodyPtr, uint16_t* bodyLen) {
+    if (inArg->writeIdx < 7) return false;
+    const uint8_t* b = reinterpret_cast<const uint8_t*>(inArg->buf);
+    *type      = b[0];
+    *sessionId = uint32_t(b[1]) | (uint32_t(b[2]) << 8) | (uint32_t(b[3]) << 16) | (uint32_t(b[4]) << 24);
+    *bodyLen   = uint16_t(b[5]) | (uint16_t(b[6]) << 8);
+    if (7 + *bodyLen > inArg->writeIdx) return false;
+    *bodyPtr = b + 7;
+    return true;
+}
+
+} // namespace chunked_wire
+
+namespace {
+RpcResult callWithRetry(RpcManager* rpc, uint16_t methodId, RpcArg* req, int maxRetries) {
+    RpcResult r{RPC_TIMEOUT, nullptr};
+    for (int attempt = 0; attempt <= maxRetries; attempt++) {
+        r = rpc->call(methodId, req);
+        if (r.error != RPC_TIMEOUT) return r;
+    }
+    return r;
+}
+} // namespace
+
+ChunkedRpcManagerWrapper::ChunkedRpcManagerWrapper(RpcManager* rpc,
+                                                   int sessionTimeoutMs,
+                                                   int maxChunkRetries)
+    : _rpc(rpc),
+      _sessionTimeoutMs(sessionTimeoutMs),
+      _maxChunkRetries(maxChunkRetries) {
+    if (_sessionTimeoutMs < 0) _sessionTimeoutMs = 4 * 5000;
+    _gcRunning = true;
+    corocgo::coro([this]() { this->_gcLoop(); });
+}
+
+ChunkedRpcManagerWrapper::~ChunkedRpcManagerWrapper() {
+    _gcRunning = false;
+}
+
+ChunkedRpcArg* ChunkedRpcManagerWrapper::getChunkedArg() {
+    return new ChunkedRpcArg();
+}
+
+void ChunkedRpcManagerWrapper::disposeChunkedArg(ChunkedRpcArg* arg) {
+    delete arg;
+}
+
+int64_t ChunkedRpcManagerWrapper::_nowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+uint32_t ChunkedRpcManagerWrapper::_generateSessionId() {
+    static uint32_t counter = 0;
+    counter = counter * 1664525u + 1013904223u + static_cast<uint32_t>(_nowMs());
+    if (counter == 0) counter = 1;
+    return counter;
+}
+
+void ChunkedRpcManagerWrapper::registerChunkedMethod(
+    uint16_t methodId, std::function<ChunkedRpcArg*(ChunkedRpcArg*)> handler) {
+    _userHandlers[methodId] = handler;
+    _rpc->registerMethod(methodId, [this, methodId](RpcArg* in) -> RpcArg* {
+        return _dispatchServer(methodId, in);
+    });
+}
+
+void ChunkedRpcManagerWrapper::_gcLoop() {
+    while (_gcRunning) {
+        // Tick at 200ms so stop() is observed quickly; effective GC granularity
+        // is still bounded by sessionTimeoutMs.
+        for (int i = 0; i < 10 && _gcRunning; i++) corocgo::sleep(200);
+        if (!_gcRunning) break;
+        int64_t now = _nowMs();
+        for (auto it = _serverSessions.begin(); it != _serverSessions.end(); ) {
+            if (now - it->second.lastActivityMs > _sessionTimeoutMs) {
+                it = _serverSessions.erase(it);
+            } else {
+                ++it;
             }
         }
-#endif // COROCRPC_STREAMING
+    }
+}
+
+// Build first response chunk (offset 0) into `out`.
+static void packFirstResponseChunk(RpcArg* out, uint32_t sid,
+                                   const std::vector<uint8_t>& respBuf) {
+    uint32_t respTotal = static_cast<uint32_t>(respBuf.size());
+    uint16_t headerLen = 8;
+    uint16_t avail = chunked_wire::MAX_CHUNK_PAYLOAD - headerLen;
+    uint32_t take = respTotal < avail ? respTotal : avail;
+    std::vector<uint8_t> body2(headerLen + take);
+    body2[0] = uint8_t(respTotal & 0xFF);
+    body2[1] = uint8_t((respTotal >> 8) & 0xFF);
+    body2[2] = uint8_t((respTotal >> 16) & 0xFF);
+    body2[3] = uint8_t((respTotal >> 24) & 0xFF);
+    body2[4] = body2[5] = body2[6] = body2[7] = 0;
+    if (take > 0) std::memcpy(body2.data() + 8, respBuf.data(), take);
+    chunked_wire::packChunk(out, chunked_wire::RESP_RESPONSE, sid,
+                            body2.data(), static_cast<uint16_t>(body2.size()));
+}
+
+RpcArg* ChunkedRpcManagerWrapper::_dispatchServer(uint16_t methodId, RpcArg* in) {
+    uint8_t  type;
+    uint32_t sid;
+    const uint8_t* body;
+    uint16_t bodyLen;
+    if (!chunked_wire::parseChunkHeader(in, &type, &sid, &body, &bodyLen)) {
+        return nullptr;
+    }
+
+    RpcArg* out = _rpc->getRpcArg();
+
+    auto sendError = [&](uint8_t code, const char* msg) {
+        std::vector<uint8_t> body2;
+        body2.push_back(code);
+        uint16_t mlen = static_cast<uint16_t>(std::strlen(msg));
+        body2.push_back(static_cast<uint8_t>(mlen & 0xFF));
+        body2.push_back(static_cast<uint8_t>((mlen >> 8) & 0xFF));
+        body2.insert(body2.end(), msg, msg + mlen);
+        chunked_wire::packChunk(out, chunked_wire::RESP_ERROR, sid,
+                                body2.data(), static_cast<uint16_t>(body2.size()));
+    };
+
+    if (type == chunked_wire::TYPE_START) {
+        if (bodyLen < 4) { sendError(chunked_wire::ERR_INTERNAL, "bad START"); return out; }
+        uint32_t totalSize =
+            uint32_t(body[0]) | (uint32_t(body[1]) << 8) |
+            (uint32_t(body[2]) << 16) | (uint32_t(body[3]) << 24);
+        uint16_t payloadLen = bodyLen - 4;
+        const uint8_t* payload = body + 4;
+
+        ServerSession s;
+        s.totalSize = totalSize;
+        s.highWaterMark = payloadLen;
+        s.requestBuf.assign(totalSize, 0);
+        if (payloadLen > 0) std::memcpy(s.requestBuf.data(), payload, payloadLen);
+        s.handlerRan = false;
+        s.lastActivityMs = _nowMs();
+        _serverSessions[sid] = std::move(s);
+
+        if (payloadLen >= totalSize) {
+            ChunkedRpcArg in2;
+            in2.assign(_serverSessions[sid].requestBuf.data(), totalSize);
+            auto it = _userHandlers.find(methodId);
+            ChunkedRpcArg* userOut = (it != _userHandlers.end()) ? it->second(&in2) : nullptr;
+            if (userOut) {
+                _serverSessions[sid].responseBuf.assign(userOut->data(),
+                                                        userOut->data() + userOut->size());
+                disposeChunkedArg(userOut);
+            }
+            _serverSessions[sid].handlerRan = true;
+            packFirstResponseChunk(out, sid, _serverSessions[sid].responseBuf);
+        } else {
+            chunked_wire::packChunk(out, chunked_wire::RESP_WAITING, sid, nullptr, 0);
+        }
+        return out;
+    }
+
+    if (type == chunked_wire::TYPE_CONTINUE_REQ) {
+        auto it = _serverSessions.find(sid);
+        if (it == _serverSessions.end()) { sendError(chunked_wire::ERR_UNKNOWN_SESSION, "unknown session"); return out; }
+        if (bodyLen < 4) { sendError(chunked_wire::ERR_INTERNAL, "short CONTINUE"); return out; }
+        uint32_t off =
+            uint32_t(body[0]) | (uint32_t(body[1]) << 8) |
+            (uint32_t(body[2]) << 16) | (uint32_t(body[3]) << 24);
+        uint16_t payloadLen = bodyLen - 4;
+        if (uint64_t(off) + payloadLen > it->second.totalSize) {
+            sendError(chunked_wire::ERR_BAD_OFFSET, "bad offset");
+            return out;
+        }
+        if (payloadLen > 0) std::memcpy(it->second.requestBuf.data() + off, body + 4, payloadLen);
+        uint32_t newHigh = off + payloadLen;
+        if (newHigh > it->second.highWaterMark) it->second.highWaterMark = newHigh;
+        it->second.lastActivityMs = _nowMs();
+
+        if (it->second.highWaterMark >= it->second.totalSize) {
+            if (!it->second.handlerRan) {
+                ChunkedRpcArg in2;
+                in2.assign(it->second.requestBuf.data(), it->second.totalSize);
+                auto h = _userHandlers.find(methodId);
+                ChunkedRpcArg* userOut = (h != _userHandlers.end()) ? h->second(&in2) : nullptr;
+                if (userOut) {
+                    it->second.responseBuf.assign(userOut->data(),
+                                                  userOut->data() + userOut->size());
+                    disposeChunkedArg(userOut);
+                }
+                it->second.handlerRan = true;
+            }
+            packFirstResponseChunk(out, sid, it->second.responseBuf);
+            return out;
+        }
+
+        chunked_wire::packChunk(out, chunked_wire::RESP_WAITING, sid, nullptr, 0);
+        return out;
+    }
+
+    if (type == chunked_wire::TYPE_NEXT_RESPONSE) {
+        auto it = _serverSessions.find(sid);
+        if (it == _serverSessions.end()) { sendError(chunked_wire::ERR_UNKNOWN_SESSION, "unknown session"); return out; }
+        if (bodyLen < 4) { sendError(chunked_wire::ERR_INTERNAL, "short NEXT_RESPONSE"); return out; }
+        uint32_t off =
+            uint32_t(body[0]) | (uint32_t(body[1]) << 8) |
+            (uint32_t(body[2]) << 16) | (uint32_t(body[3]) << 24);
+        it->second.lastActivityMs = _nowMs();
+        uint32_t respTotal = static_cast<uint32_t>(it->second.responseBuf.size());
+        if (off > respTotal) { sendError(chunked_wire::ERR_BAD_OFFSET, "bad response offset"); return out; }
+        uint16_t headerLen = 8;
+        uint16_t avail = chunked_wire::MAX_CHUNK_PAYLOAD - headerLen;
+        uint32_t remain = respTotal - off;
+        uint32_t take = remain < avail ? remain : avail;
+        std::vector<uint8_t> body2(headerLen + take);
+        body2[0] = uint8_t(respTotal & 0xFF);
+        body2[1] = uint8_t((respTotal >> 8) & 0xFF);
+        body2[2] = uint8_t((respTotal >> 16) & 0xFF);
+        body2[3] = uint8_t((respTotal >> 24) & 0xFF);
+        body2[4] = uint8_t(off & 0xFF);
+        body2[5] = uint8_t((off >> 8) & 0xFF);
+        body2[6] = uint8_t((off >> 16) & 0xFF);
+        body2[7] = uint8_t((off >> 24) & 0xFF);
+        if (take > 0) std::memcpy(body2.data() + 8, it->second.responseBuf.data() + off, take);
+        chunked_wire::packChunk(out, chunked_wire::RESP_RESPONSE, sid,
+                                body2.data(), static_cast<uint16_t>(body2.size()));
+        return out;
+    }
+
+    if (type == chunked_wire::TYPE_FINISH) {
+        _serverSessions.erase(sid);
+        chunked_wire::packChunk(out, chunked_wire::RESP_FINISH_ACK, sid, nullptr, 0);
+        return out;
+    }
+
+    sendError(chunked_wire::ERR_INTERNAL, "unsupported chunk type");
+    return out;
+}
+
+ChunkedRpcResult ChunkedRpcManagerWrapper::callChunked(uint16_t methodId, ChunkedRpcArg* arg) {
+    uint32_t sid = _generateSessionId();
+    uint32_t totalSize = arg->size();
+    const uint8_t* src = arg->data();
+
+    // ── Send START + CONTINUE_REQ chunks ──
+    uint16_t firstHeaderLen = 4;
+    uint32_t firstAvail = chunked_wire::MAX_CHUNK_PAYLOAD - firstHeaderLen;
+    uint32_t firstTake = totalSize < firstAvail ? totalSize : firstAvail;
+
+    std::vector<uint8_t> startBody(firstHeaderLen + firstTake);
+    startBody[0] = uint8_t(totalSize & 0xFF);
+    startBody[1] = uint8_t((totalSize >> 8) & 0xFF);
+    startBody[2] = uint8_t((totalSize >> 16) & 0xFF);
+    startBody[3] = uint8_t((totalSize >> 24) & 0xFF);
+    if (firstTake > 0) std::memcpy(startBody.data() + 4, src, firstTake);
+    uint32_t reqOffset = firstTake;
+
+    RpcArg* req = _rpc->getRpcArg();
+    chunked_wire::packChunk(req, chunked_wire::TYPE_START, sid,
+                            startBody.data(), static_cast<uint16_t>(startBody.size()));
+    RpcResult r = callWithRetry(_rpc, methodId, req, _maxChunkRetries);
+    _rpc->disposeRpcArg(req);
+    if (r.error != RPC_OK) return ChunkedRpcResult{ r.error, 0, "", nullptr };
+
+    while (true) {
+        uint8_t rtype; uint32_t rsid; const uint8_t* rbody; uint16_t rlen;
+        bool ok = chunked_wire::parseChunkHeader(r.arg, &rtype, &rsid, &rbody, &rlen);
+        if (!ok || rsid != sid) {
+            _rpc->disposeRpcArg(r.arg);
+            return ChunkedRpcResult{ RPC_CHUNKED_ERROR, chunked_wire::ERR_INTERNAL, "bad response", nullptr };
+        }
+
+        if (rtype == chunked_wire::RESP_ERROR) {
+            uint8_t code = rlen >= 1 ? rbody[0] : 0;
+            std::string msg;
+            if (rlen >= 3) {
+                uint16_t mlen = uint16_t(rbody[1]) | (uint16_t(rbody[2]) << 8);
+                if (uint32_t(3) + mlen <= rlen) msg.assign(reinterpret_cast<const char*>(rbody + 3), mlen);
+            }
+            _rpc->disposeRpcArg(r.arg);
+            return ChunkedRpcResult{ RPC_CHUNKED_ERROR, code, msg, nullptr };
+        }
+
+        if (rtype == chunked_wire::RESP_RESPONSE) {
+            if (rlen < 8) {
+                _rpc->disposeRpcArg(r.arg);
+                return ChunkedRpcResult{ RPC_CHUNKED_ERROR, chunked_wire::ERR_INTERNAL, "short RESPONSE", nullptr };
+            }
+            uint32_t respTotal =
+                uint32_t(rbody[0]) | (uint32_t(rbody[1]) << 8) |
+                (uint32_t(rbody[2]) << 16) | (uint32_t(rbody[3]) << 24);
+            uint32_t respOffset =
+                uint32_t(rbody[4]) | (uint32_t(rbody[5]) << 8) |
+                (uint32_t(rbody[6]) << 16) | (uint32_t(rbody[7]) << 24);
+            uint32_t respPayloadLen = uint32_t(rlen - 8);
+
+            ChunkedRpcArg* outArg = getChunkedArg();
+            outArg->resize(respTotal);
+            if (respPayloadLen > 0) std::memcpy(outArg->data() + respOffset, rbody + 8, respPayloadLen);
+            uint32_t respGot = respOffset + respPayloadLen;
+            _rpc->disposeRpcArg(r.arg);
+
+            while (respGot < respTotal) {
+                uint8_t bodyN[4];
+                bodyN[0] = uint8_t(respGot & 0xFF);
+                bodyN[1] = uint8_t((respGot >> 8) & 0xFF);
+                bodyN[2] = uint8_t((respGot >> 16) & 0xFF);
+                bodyN[3] = uint8_t((respGot >> 24) & 0xFF);
+                RpcArg* req3 = _rpc->getRpcArg();
+                chunked_wire::packChunk(req3, chunked_wire::TYPE_NEXT_RESPONSE, sid, bodyN, 4);
+                RpcResult r2 = callWithRetry(_rpc, methodId, req3, _maxChunkRetries);
+                _rpc->disposeRpcArg(req3);
+                if (r2.error != RPC_OK) {
+                    disposeChunkedArg(outArg);
+                    return ChunkedRpcResult{ r2.error, 0, "", nullptr };
+                }
+                uint8_t t2; uint32_t s2; const uint8_t* b2; uint16_t l2;
+                bool ok2 = chunked_wire::parseChunkHeader(r2.arg, &t2, &s2, &b2, &l2);
+                if (!ok2 || s2 != sid || t2 != chunked_wire::RESP_RESPONSE || l2 < 8) {
+                    _rpc->disposeRpcArg(r2.arg);
+                    disposeChunkedArg(outArg);
+                    return ChunkedRpcResult{ RPC_CHUNKED_ERROR, chunked_wire::ERR_INTERNAL, "bad NEXT_RESPONSE reply", nullptr };
+                }
+                uint32_t off2 =
+                    uint32_t(b2[4]) | (uint32_t(b2[5]) << 8) |
+                    (uint32_t(b2[6]) << 16) | (uint32_t(b2[7]) << 24);
+                uint32_t pl2 = uint32_t(l2 - 8);
+                if (off2 + pl2 > respTotal) {
+                    _rpc->disposeRpcArg(r2.arg);
+                    disposeChunkedArg(outArg);
+                    return ChunkedRpcResult{ RPC_CHUNKED_ERROR, chunked_wire::ERR_INTERNAL, "response overrun", nullptr };
+                }
+                if (pl2 > 0) std::memcpy(outArg->data() + off2, b2 + 8, pl2);
+                if (off2 + pl2 > respGot) respGot = off2 + pl2;
+                _rpc->disposeRpcArg(r2.arg);
+            }
+
+            // Send FINISH (un-retried; caller already has the data).
+            {
+                RpcArg* finReq = _rpc->getRpcArg();
+                chunked_wire::packChunk(finReq, chunked_wire::TYPE_FINISH, sid, nullptr, 0);
+                RpcResult fr = _rpc->call(methodId, finReq);
+                _rpc->disposeRpcArg(finReq);
+                if (fr.error == RPC_OK) _rpc->disposeRpcArg(fr.arg);
+            }
+
+            return ChunkedRpcResult{ RPC_OK, 0, "", outArg };
+        }
+
+        if (rtype != chunked_wire::RESP_WAITING) {
+            _rpc->disposeRpcArg(r.arg);
+            return ChunkedRpcResult{ RPC_CHUNKED_ERROR, chunked_wire::ERR_INTERNAL, "unexpected resp type", nullptr };
+        }
+        _rpc->disposeRpcArg(r.arg);
+
+        if (reqOffset >= totalSize) {
+            return ChunkedRpcResult{ RPC_CHUNKED_ERROR, chunked_wire::ERR_INTERNAL, "WAITING after full request", nullptr };
+        }
+        uint16_t contHeaderLen = 4;
+        uint32_t contAvail = chunked_wire::MAX_CHUNK_PAYLOAD - contHeaderLen;
+        uint32_t remain = totalSize - reqOffset;
+        uint32_t cTake = remain < contAvail ? remain : contAvail;
+        std::vector<uint8_t> cb(contHeaderLen + cTake);
+        cb[0] = uint8_t(reqOffset & 0xFF);
+        cb[1] = uint8_t((reqOffset >> 8) & 0xFF);
+        cb[2] = uint8_t((reqOffset >> 16) & 0xFF);
+        cb[3] = uint8_t((reqOffset >> 24) & 0xFF);
+        std::memcpy(cb.data() + 4, src + reqOffset, cTake);
+        reqOffset += cTake;
+
+        RpcArg* req2 = _rpc->getRpcArg();
+        chunked_wire::packChunk(req2, chunked_wire::TYPE_CONTINUE_REQ, sid,
+                                cb.data(), static_cast<uint16_t>(cb.size()));
+        r = callWithRetry(_rpc, methodId, req2, _maxChunkRetries);
+        _rpc->disposeRpcArg(req2);
+        if (r.error != RPC_OK) return ChunkedRpcResult{ r.error, 0, "", nullptr };
     }
 }
 
